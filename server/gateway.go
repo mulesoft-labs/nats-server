@@ -2237,7 +2237,7 @@ var subPool = &sync.Pool{
 // it is known that this gateway has no interest in the account or
 // subject, etc..
 // <Invoked from any client connection's readLoop>
-func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgroups [][]byte) {
+func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgroups [][]byte) bool {
 	gwsa := [16]*client{}
 	gws := gwsa[:0]
 	// This is in fast path, so avoid calling function when possible.
@@ -2251,7 +2251,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 	thisClusterReplyPrefix := gw.replyPfx
 	gw.RUnlock()
 	if len(gws) == 0 {
-		return
+		return false
 	}
 	var (
 		subj       = string(subject)
@@ -2262,6 +2262,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 		mreply     []byte
 		dstPfx     []byte
 		checkReply = len(reply) > 0
+		didDeliver bool
 	)
 
 	// Get a subscription from the pool
@@ -2357,10 +2358,12 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 		sub.client = gwc
 		sub.subject = c.pa.subject
 		c.deliverMsg(sub, c.pa.subject, mh, msg)
+		didDeliver = true
 	}
 	// Done with subscription, put back to pool. We don't need
 	// to reset content since we explicitly set when using it.
 	subPool.Put(sub)
+	return didDeliver
 }
 
 func (s *Server) gatewayHandleServiceImport(acc *Account, subject []byte, c *client, change int32) {

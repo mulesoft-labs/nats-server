@@ -2585,7 +2585,7 @@ func (c *client) processInboundMsg(msg []byte) {
 }
 
 // processInboundClientMsg is called to process an inbound msg from a client.
-func (c *client) processInboundClientMsg(msg []byte) {
+func (c *client) processInboundClientMsg(msg []byte) bool {
 	// Update statistics
 	// The msg includes the CR_LF, so pull back out for accounting.
 	c.in.msgs++
@@ -2598,13 +2598,13 @@ func (c *client) processInboundClientMsg(msg []byte) {
 	// Check pub permissions
 	if c.perms != nil && (c.perms.pub.allow != nil || c.perms.pub.deny != nil) && !c.pubAllowed(string(c.pa.subject)) {
 		c.pubPermissionViolation(c.pa.subject)
-		return
+		return false
 	}
 
 	// Now check for reserved replies. These are used for service imports.
 	if isServiceReply(c.pa.reply) {
 		c.replySubjectViolation(c.pa.reply)
-		return
+		return false
 	}
 
 	if c.opts.Verbose {
@@ -2613,12 +2613,15 @@ func (c *client) processInboundClientMsg(msg []byte) {
 
 	// Mostly under testing scenarios.
 	if c.srv == nil || c.acc == nil {
-		return
+		return false
 	}
+
+	// Indication if we attempted to deliver the message to anyone.
+	var didDeliver bool
 
 	// Check to see if we need to map/route to another account.
 	if c.acc.imports.services != nil {
-		c.checkForImportServices(c.acc, msg)
+		didDeliver = c.checkForImportServices(c.acc, msg)
 	}
 
 	// If we have an exported service and we are doing remote tracking, check this subject
@@ -2680,6 +2683,7 @@ func (c *client) processInboundClientMsg(msg []byte) {
 	// Check for no interest, short circuit if so.
 	// This is the fanout scale.
 	if len(r.psubs)+len(r.qsubs) > 0 {
+		didDeliver = true
 		flag := pmrNoFlag
 		// If we have queue subs in this cluster, then if we run in gateway
 		// mode and the remote gateways have queue subs, then we need to
@@ -2700,21 +2704,25 @@ func (c *client) processInboundClientMsg(msg []byte) {
 
 	// Now deal with gateways
 	if c.srv.gateway.enabled {
-		c.sendMsgToGateways(c.acc, msg, c.pa.subject, c.pa.reply, qnames)
+		didDeliver = c.sendMsgToGateways(c.acc, msg, c.pa.subject, c.pa.reply, qnames) || didDeliver
 	}
+
+	return didDeliver
 }
 
 // This checks and process import services by doing the mapping and sending the
 // message onward if applicable.
-func (c *client) checkForImportServices(acc *Account, msg []byte) {
+func (c *client) checkForImportServices(acc *Account, msg []byte) bool {
 	if acc == nil || acc.imports.services == nil {
-		return
+		return false
 	}
 
 	acc.mu.RLock()
 	si := acc.imports.services[string(c.pa.subject)]
 	invalid := si != nil && si.invalid
 	acc.mu.RUnlock()
+
+	var didDeliver bool
 
 	// Get the results from the other account for the mapped "to" subject.
 	// If we have been marked invalid simply return here.
@@ -2747,12 +2755,16 @@ func (c *client) checkForImportServices(acc *Account, msg []byte) {
 		// FIXME(dlc) - Do L1 cache trick from above.
 		rr := si.acc.sl.Match(si.to)
 
-		// Check to see if we have no results and this is an internal serviceImport. If so we
-		// need to clean that up.
+		// Check to see if we have no results and this is an internal serviceImport.
+		// If so we need to clean that up.
 		if len(rr.psubs)+len(rr.qsubs) == 0 && si.internal {
 			// We may also have a response entry, so go through that way.
 			si.acc.checkForRespEntry(si.to)
 		}
+
+		// This gives us a notion that we have interest in this message.
+		// We need to check if this is false but we have
+		didDeliver = len(rr.psubs)+len(rr.qsubs) > 0
 
 		// If we are a route or gateway or leafnode and this message is flipped to a queue subscriber we
 		// need to handle that since the processMsgResults will want a queue filter.
@@ -2764,7 +2776,7 @@ func (c *client) checkForImportServices(acc *Account, msg []byte) {
 		// try to send this converted message to all gateways.
 		if c.srv.gateway.enabled && (c.kind == CLIENT || c.kind == SYSTEM || c.kind == LEAF) {
 			queues := c.processMsgResults(si.acc, rr, msg, []byte(si.to), nrr, pmrCollectQueueNames)
-			c.sendMsgToGateways(si.acc, msg, []byte(si.to), nrr, queues)
+			didDeliver = c.sendMsgToGateways(si.acc, msg, []byte(si.to), nrr, queues) || didDeliver
 		} else {
 			c.processMsgResults(si.acc, rr, msg, []byte(si.to), nrr, pmrNoFlag)
 		}
@@ -2781,8 +2793,9 @@ func (c *client) checkForImportServices(acc *Account, msg []byte) {
 		if shouldRemove {
 			acc.removeServiceImport(si.from)
 		}
-
 	}
+
+	return didDeliver
 }
 
 func (c *client) addSubToRouteTargets(sub *subscription) {
