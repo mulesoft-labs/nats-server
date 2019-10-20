@@ -456,11 +456,12 @@ func (a *Account) AddServiceExport(subject string, accounts []*Account) error {
 
 // AddServiceExportWithresponse will configure the account with the defined export and response type.
 func (a *Account) AddServiceExportWithResponse(subject string, respType ServiceRespType, accounts []*Account) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a == nil {
 		return ErrMissingAccount
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	if a.exports.services == nil {
 		a.exports.services = make(map[string]*serviceExport)
 	}
@@ -1103,11 +1104,13 @@ var IsPublicExport = []*Account(nil)
 // AddStreamExport will add an export to the account. If accounts is nil
 // it will signify a public export, meaning anyone can impoort.
 func (a *Account) AddStreamExport(subject string, accounts []*Account) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a == nil {
 		return ErrMissingAccount
 	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	if a.exports.streams == nil {
 		a.exports.streams = make(map[string]*streamExport)
 	}
