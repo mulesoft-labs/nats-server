@@ -1,4 +1,4 @@
-// Copyright 2013-2019 The NATS Authors
+// Copyright 2013-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,9 +14,13 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +45,20 @@ func checkNumRoutes(t *testing.T, s *Server, expected int) {
 	})
 }
 
+func checkSubInterest(t *testing.T, s *Server, accName, subject string, timeout time.Duration) {
+	t.Helper()
+	checkFor(t, timeout, 15*time.Millisecond, func() error {
+		acc, err := s.LookupAccount(accName)
+		if err != nil {
+			return fmt.Errorf("error looking up account %q: %v", accName, err)
+		}
+		if acc.SubscriptionInterest(subject) {
+			return nil
+		}
+		return fmt.Errorf("no subscription interest for account %q on %q", accName, subject)
+	})
+}
+
 func TestRouteConfig(t *testing.T) {
 	opts, err := ProcessConfigFile("./configs/cluster.conf")
 	if err != nil {
@@ -55,6 +73,7 @@ func TestRouteConfig(t *testing.T) {
 		Password:    "porkchop",
 		AuthTimeout: 1.0,
 		Cluster: ClusterOpts{
+			Name:           "abc",
 			Host:           "127.0.0.1",
 			Port:           4244,
 			Username:       "route_user",
@@ -63,7 +82,7 @@ func TestRouteConfig(t *testing.T) {
 			NoAdvertise:    true,
 			ConnectRetries: 2,
 		},
-		PidFile: "/tmp/nats_cluster_test.pid",
+		PidFile: "/tmp/nats-server/nats_cluster_test.pid",
 	}
 
 	// Setup URLs
@@ -76,7 +95,7 @@ func TestRouteConfig(t *testing.T) {
 }
 
 func TestClusterAdvertise(t *testing.T) {
-	lst, err := net.Listen("tcp", "127.0.0.1:0")
+	lst, err := natsListen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Error starting listener: %v", err)
 	}
@@ -91,7 +110,8 @@ func TestClusterAdvertise(t *testing.T) {
 		ch <- nil
 	}()
 
-	optsA, _ := ProcessConfigFile("./configs/seed.conf")
+	optsA, err := ProcessConfigFile("./configs/seed.conf")
+	require_NoError(t, err)
 	optsA.NoSigs, optsA.NoLog = true, true
 	srvA := RunServer(optsA)
 	defer srvA.Shutdown()
@@ -131,33 +151,12 @@ func TestClusterAdvertiseErrorOnStartup(t *testing.T) {
 	opts := DefaultOptions()
 	// Set invalid address
 	opts.Cluster.Advertise = "addr:::123"
-	s := New(opts)
-	defer s.Shutdown()
-	dl := &DummyLogger{}
-	s.SetLogger(dl, false, false)
-
-	// Start will keep running, so start in a go-routine.
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		s.Start()
-		wg.Done()
-	}()
-	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
-		dl.Lock()
-		msg := dl.msg
-		dl.Unlock()
-		if strings.Contains(msg, "Cluster.Advertise") {
-			return nil
-		}
-		return fmt.Errorf("Did not get expected error, got %v", msg)
-	})
-	s.Shutdown()
-	wg.Wait()
+	testFatalErrorOnStart(t, opts, "Cluster.Advertise")
 }
 
 func TestClientAdvertise(t *testing.T) {
-	optsA, _ := ProcessConfigFile("./configs/seed.conf")
+	optsA, err := ProcessConfigFile("./configs/seed.conf")
+	require_NoError(t, err)
 	optsA.NoSigs, optsA.NoLog = true, true
 
 	srvA := RunServer(optsA)
@@ -188,8 +187,10 @@ func TestClientAdvertise(t *testing.T) {
 }
 
 func TestServerRoutesWithClients(t *testing.T) {
-	optsA, _ := ProcessConfigFile("./configs/srv_a.conf")
-	optsB, _ := ProcessConfigFile("./configs/srv_b.conf")
+	optsA, err := ProcessConfigFile("./configs/srv_a.conf")
+	require_NoError(t, err)
+	optsB, err := ProcessConfigFile("./configs/srv_b.conf")
+	require_NoError(t, err)
 
 	optsA.NoSigs, optsA.NoLog = true, true
 	optsB.NoSigs, optsB.NoLog = true, true
@@ -230,8 +231,10 @@ func TestServerRoutesWithClients(t *testing.T) {
 }
 
 func TestServerRoutesWithAuthAndBCrypt(t *testing.T) {
-	optsA, _ := ProcessConfigFile("./configs/srv_a_bcrypt.conf")
-	optsB, _ := ProcessConfigFile("./configs/srv_b_bcrypt.conf")
+	optsA, err := ProcessConfigFile("./configs/srv_a_bcrypt.conf")
+	require_NoError(t, err)
+	optsB, err := ProcessConfigFile("./configs/srv_b_bcrypt.conf")
+	require_NoError(t, err)
 
 	optsA.NoSigs, optsA.NoLog = true, true
 	optsB.NoSigs, optsB.NoLog = true, true
@@ -263,6 +266,8 @@ func TestServerRoutesWithAuthAndBCrypt(t *testing.T) {
 	nc1.Flush()
 	defer sub.Unsubscribe()
 
+	checkSubInterest(t, srvB, globalAccountName, "foo", time.Second)
+
 	nc2, err := nats.Connect(urlB)
 	if err != nil {
 		t.Fatalf("Error creating client: %v\n", err)
@@ -280,7 +285,7 @@ func TestServerRoutesWithAuthAndBCrypt(t *testing.T) {
 }
 
 // Helper function to check that a cluster is formed
-func checkClusterFormed(t *testing.T, servers ...*Server) {
+func checkClusterFormed(t testing.TB, servers ...*Server) {
 	t.Helper()
 	expectedNumRoutes := len(servers) - 1
 	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
@@ -302,13 +307,16 @@ func nextServerOpts(opts *Options) *Options {
 	if nopts.Gateway.Name != "" {
 		nopts.Gateway.Port = -1
 	}
+	nopts.ServerName = ""
 	return &nopts
 }
 
 func TestSeedSolicitWorks(t *testing.T) {
-	optsSeed, _ := ProcessConfigFile("./configs/seed.conf")
+	optsSeed, err := ProcessConfigFile("./configs/seed.conf")
+	require_NoError(t, err)
 
 	optsSeed.NoSigs, optsSeed.NoLog = true, true
+	optsSeed.NoSystemAccount = true
 
 	srvSeed := RunServer(optsSeed)
 	defer srvSeed.Shutdown()
@@ -362,9 +370,11 @@ func TestSeedSolicitWorks(t *testing.T) {
 }
 
 func TestTLSSeedSolicitWorks(t *testing.T) {
-	optsSeed, _ := ProcessConfigFile("./configs/seed_tls.conf")
+	optsSeed, err := ProcessConfigFile("./configs/seed_tls.conf")
+	require_NoError(t, err)
 
 	optsSeed.NoSigs, optsSeed.NoLog = true, true
+	optsSeed.NoSystemAccount = true
 
 	srvSeed := RunServer(optsSeed)
 	defer srvSeed.Shutdown()
@@ -418,9 +428,11 @@ func TestTLSSeedSolicitWorks(t *testing.T) {
 }
 
 func TestChainedSolicitWorks(t *testing.T) {
-	optsSeed, _ := ProcessConfigFile("./configs/seed.conf")
+	optsSeed, err := ProcessConfigFile("./configs/seed.conf")
+	require_NoError(t, err)
 
 	optsSeed.NoSigs, optsSeed.NoLog = true, true
+	optsSeed.NoSystemAccount = true
 
 	srvSeed := RunServer(optsSeed)
 	defer srvSeed.Shutdown()
@@ -479,7 +491,7 @@ func TestChainedSolicitWorks(t *testing.T) {
 // expected number of subscriptions.
 func checkExpectedSubs(t *testing.T, expected int, servers ...*Server) {
 	t.Helper()
-	checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
+	checkFor(t, 4*time.Second, 10*time.Millisecond, func() error {
 		for _, s := range servers {
 			if numSubs := int(s.NumSubscriptions()); numSubs != expected {
 				return fmt.Errorf("Expected %d subscriptions for server %q, got %d", expected, s.ID(), numSubs)
@@ -490,9 +502,11 @@ func checkExpectedSubs(t *testing.T, expected int, servers ...*Server) {
 }
 
 func TestTLSChainedSolicitWorks(t *testing.T) {
-	optsSeed, _ := ProcessConfigFile("./configs/seed_tls.conf")
+	optsSeed, err := ProcessConfigFile("./configs/seed_tls.conf")
+	require_NoError(t, err)
 
 	optsSeed.NoSigs, optsSeed.NoLog = true, true
+	optsSeed.NoSystemAccount = true
 
 	srvSeed := RunServer(optsSeed)
 	defer srvSeed.Shutdown()
@@ -548,7 +562,8 @@ func TestTLSChainedSolicitWorks(t *testing.T) {
 }
 
 func TestRouteTLSHandshakeError(t *testing.T) {
-	optsSeed, _ := ProcessConfigFile("./configs/seed_tls.conf")
+	optsSeed, err := ProcessConfigFile("./configs/seed_tls.conf")
+	require_NoError(t, err)
 	optsSeed.NoLog = true
 	optsSeed.NoSigs = true
 	srvSeed := RunServer(optsSeed)
@@ -752,6 +767,7 @@ func wait(ch chan bool) error {
 
 func TestServerPoolUpdatedWhenRouteGoesAway(t *testing.T) {
 	s1Opts := DefaultOptions()
+	s1Opts.ServerName = "A"
 	s1Opts.Host = "127.0.0.1"
 	s1Opts.Port = 4222
 	s1Opts.Cluster.Host = "127.0.0.1"
@@ -770,6 +786,7 @@ func TestServerPoolUpdatedWhenRouteGoesAway(t *testing.T) {
 		chch <- true
 	}
 	nc, err := nats.Connect(s1Url,
+		nats.ReconnectWait(50*time.Millisecond),
 		nats.ReconnectHandler(connHandler),
 		nats.DiscoveredServersHandler(func(_ *nats.Conn) {
 			ch <- true
@@ -777,8 +794,10 @@ func TestServerPoolUpdatedWhenRouteGoesAway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on connect")
 	}
+	defer nc.Close()
 
 	s2Opts := DefaultOptions()
+	s2Opts.ServerName = "B"
 	s2Opts.Host = "127.0.0.1"
 	s2Opts.Port = s1Opts.Port + 1
 	s2Opts.Cluster.Host = "127.0.0.1"
@@ -793,6 +812,7 @@ func TestServerPoolUpdatedWhenRouteGoesAway(t *testing.T) {
 	}
 
 	checkPool := func(expected []string) {
+		t.Helper()
 		// Don't use discovered here, but Servers to have the full list.
 		// Also, there may be cases where the mesh is not formed yet,
 		// so try again on failure.
@@ -821,6 +841,7 @@ func TestServerPoolUpdatedWhenRouteGoesAway(t *testing.T) {
 	checkPool([]string{s1Url, s2Url})
 
 	s3Opts := DefaultOptions()
+	s3Opts.ServerName = "C"
 	s3Opts.Host = "127.0.0.1"
 	s3Opts.Port = s2Opts.Port + 1
 	s3Opts.Cluster.Host = "127.0.0.1"
@@ -867,10 +888,12 @@ func TestServerPoolUpdatedWhenRouteGoesAway(t *testing.T) {
 }
 
 func TestRouteFailedConnRemovedFromTmpMap(t *testing.T) {
-	optsA, _ := ProcessConfigFile("./configs/srv_a.conf")
+	optsA, err := ProcessConfigFile("./configs/srv_a.conf")
+	require_NoError(t, err)
 	optsA.NoSigs, optsA.NoLog = true, true
 
-	optsB, _ := ProcessConfigFile("./configs/srv_b.conf")
+	optsB, err := ProcessConfigFile("./configs/srv_b.conf")
+	require_NoError(t, err)
 	optsB.NoSigs, optsB.NoLog = true, true
 
 	srvA := New(optsA)
@@ -927,7 +950,8 @@ func TestRoutePermsAppliedOnInboundAndOutboundRoute(t *testing.T) {
 		},
 	}
 
-	optsA, _ := ProcessConfigFile("./configs/seed.conf")
+	optsA, err := ProcessConfigFile("./configs/seed.conf")
+	require_NoError(t, err)
 	optsA.NoLog = true
 	optsA.NoSigs = true
 	optsA.Cluster.Permissions = perms
@@ -1006,7 +1030,9 @@ func TestRoutePermsAppliedOnInboundAndOutboundRoute(t *testing.T) {
 
 func TestRouteSendLocalSubsWithLowMaxPending(t *testing.T) {
 	optsA := DefaultOptions()
+	optsA.MaxPayload = 1024
 	optsA.MaxPending = 1024
+	optsA.NoSystemAccount = true
 	srvA := RunServer(optsA)
 	defer srvA.Shutdown()
 
@@ -1025,6 +1051,7 @@ func TestRouteSendLocalSubsWithLowMaxPending(t *testing.T) {
 	// Now create a route between B and A
 	optsB := DefaultOptions()
 	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", optsA.Cluster.Host, optsA.Cluster.Port))
+	optsB.NoSystemAccount = true
 	srvB := RunServer(optsB)
 	defer srvB.Shutdown()
 
@@ -1069,8 +1096,8 @@ func TestRouteNoCrashOnAddingSubToRoute(t *testing.T) {
 
 	// Make sure all subs are registered in s.
 	checkFor(t, time.Second, 15*time.Millisecond, func() error {
-		if s.globalAccount().TotalSubs() != int(numRoutes) {
-			return fmt.Errorf("Not all %v routed subs were registered", numRoutes)
+		if ts := s.globalAccount().TotalSubs() - 4; ts != int(numRoutes) {
+			return fmt.Errorf("Not all %d routed subs were registered: %d", numRoutes, ts)
 		}
 		return nil
 	})
@@ -1171,4 +1198,562 @@ func TestRouteRTT(t *testing.T) {
 	checkClusterFormed(t, sa, sb)
 	checkRTT(t, sa)
 	checkRTT(t, sb)
+}
+
+func TestRouteCloseTLSConnection(t *testing.T) {
+	opts := DefaultOptions()
+	opts.DisableShortFirstPing = true
+	opts.Cluster.Name = "A"
+	opts.Cluster.Host = "127.0.0.1"
+	opts.Cluster.Port = -1
+	opts.Cluster.TLSTimeout = 100
+	tc := &TLSConfigOpts{
+		CertFile: "./configs/certs/server.pem",
+		KeyFile:  "./configs/certs/key.pem",
+		Insecure: true,
+	}
+	tlsConf, err := GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating tls config: %v", err)
+	}
+	opts.Cluster.TLSConfig = tlsConf
+	opts.NoLog = true
+	opts.NoSigs = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	endpoint := fmt.Sprintf("%s:%d", opts.Cluster.Host, opts.Cluster.Port)
+	conn, err := net.DialTimeout("tcp", endpoint, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error on dial: %v", err)
+	}
+	defer conn.Close()
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	defer tlsConn.Close()
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("Unexpected error during handshake: %v", err)
+	}
+	connectOp := []byte("CONNECT {\"name\":\"route\",\"verbose\":false,\"pedantic\":false,\"tls_required\":true,\"cluster\":\"A\"}\r\n")
+	if _, err := tlsConn.Write(connectOp); err != nil {
+		t.Fatalf("Unexpected error writing CONNECT: %v", err)
+	}
+	infoOp := []byte("INFO {\"server_id\":\"route\",\"tls_required\":true}\r\n")
+	if _, err := tlsConn.Write(infoOp); err != nil {
+		t.Fatalf("Unexpected error writing CONNECT: %v", err)
+	}
+	if _, err := tlsConn.Write([]byte("PING\r\n")); err != nil {
+		t.Fatalf("Unexpected error writing PING: %v", err)
+	}
+
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if s.NumRoutes() != 1 {
+			return fmt.Errorf("No route registered yet")
+		}
+		return nil
+	})
+
+	// Get route connection
+	var route *client
+	s.mu.Lock()
+	for _, r := range s.routes {
+		route = r
+		break
+	}
+	s.mu.Unlock()
+	// Fill the buffer. We want to timeout on write so that nc.Close()
+	// would block due to a write that cannot complete.
+	buf := make([]byte, 64*1024)
+	done := false
+	for !done {
+		route.nc.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := route.nc.Write(buf); err != nil {
+			done = true
+		}
+		route.nc.SetWriteDeadline(time.Time{})
+	}
+	ch := make(chan bool)
+	go func() {
+		select {
+		case <-ch:
+			return
+		case <-time.After(3 * time.Second):
+			fmt.Println("!!!! closeConnection is blocked, test will hang !!!")
+			return
+		}
+	}()
+	// Close the route
+	route.closeConnection(SlowConsumerWriteDeadline)
+	ch <- true
+}
+
+func TestRouteClusterNameConflictBetweenStaticAndDynamic(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.Cluster.Name = "AAAAAAAAAAAAAAAAAAAA" // make it alphabetically the "smallest"
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.Cluster.Name = "" // intentional, let it be assigned dynamically
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+}
+
+type testRouteResolver struct{}
+
+func (r *testRouteResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	return []string{"127.0.0.1", "other.host.in.cluster"}, nil
+}
+
+type routeHostLookupLogger struct {
+	DummyLogger
+	errCh chan string
+	ch    chan bool
+	count int
+}
+
+func (l *routeHostLookupLogger) Debugf(format string, v ...interface{}) {
+	l.Lock()
+	defer l.Unlock()
+	msg := fmt.Sprintf(format, v...)
+	if strings.Contains(msg, "127.0.0.1:1234") {
+		l.errCh <- msg
+	} else if strings.Contains(msg, "other.host.in.cluster") {
+		if l.count++; l.count == 10 {
+			l.ch <- true
+		}
+	}
+}
+
+func TestRouteIPResolutionAndRouteToSelf(t *testing.T) {
+	o := DefaultOptions()
+	o.Cluster.Port = 1234
+	r := &testRouteResolver{}
+	o.Cluster.resolver = r
+	o.Routes = RoutesFromStr("nats://routehost:1234")
+	o.Debug = true
+	o.NoLog = false
+	s, err := NewServer(o)
+	if err != nil {
+		t.Fatalf("Error creating server: %v", err)
+	}
+	defer s.Shutdown()
+	l := &routeHostLookupLogger{errCh: make(chan string, 1), ch: make(chan bool, 1)}
+	s.SetLogger(l, true, true)
+	go func() {
+		s.Start()
+	}()
+	if err := s.readyForConnections(time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case e := <-l.errCh:
+		t.Fatalf("Unexpected trace: %q", e)
+	case <-l.ch:
+		// Ok
+		return
+	}
+}
+
+func TestRouteDuplicateServerName(t *testing.T) {
+	o := DefaultOptions()
+	o.ServerName = "A"
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	l := &captureErrorLogger{errCh: make(chan string, 1)}
+	s.SetLogger(l, false, false)
+
+	o2 := DefaultOptions()
+	// Set the same server name on purpose
+	o2.ServerName = "A"
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	// This is an error now so can't wait on cluster formed.
+	select {
+	case w := <-l.errCh:
+		if !strings.Contains(w, "Remote server has a duplicate name") {
+			t.Fatalf("Expected warning about same name, got %q", w)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Should have gotten a warning regarding duplicate server name")
+	}
+}
+
+func TestRouteLockReleasedOnTLSFailure(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.Cluster.Name = "abc"
+	o1.Cluster.Host = "127.0.0.1"
+	o1.Cluster.Port = -1
+	o1.Cluster.TLSTimeout = 0.25
+	tc := &TLSConfigOpts{
+		CertFile: "./configs/certs/server.pem",
+		KeyFile:  "./configs/certs/key.pem",
+		Insecure: true,
+	}
+	tlsConf, err := GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating tls config: %v", err)
+	}
+	o1.Cluster.TLSConfig = tlsConf
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	l := &captureErrorLogger{errCh: make(chan string, 10)}
+	s1.SetLogger(l, false, false)
+
+	o2 := DefaultOptions()
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	select {
+	case err := <-l.errCh:
+		if !strings.Contains(err, "TLS") {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	case <-time.After(time.Second):
+	}
+
+	s2.Shutdown()
+
+	// Wait for longer than the TLS timeout and check that tlsTimeout is not stuck
+	time.Sleep(500 * time.Millisecond)
+
+	buf := make([]byte, 10000)
+	n := runtime.Stack(buf, true)
+	if bytes.Contains(buf[:n], []byte("tlsTimeout")) {
+		t.Fatal("Seem connection lock was not released")
+	}
+}
+
+type localhostResolver struct{}
+
+func (r *localhostResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	return []string{"127.0.0.1"}, nil
+}
+
+func TestTLSRoutesCertificateImplicitAllowPass(t *testing.T) {
+	testTLSRoutesCertificateImplicitAllow(t, true)
+}
+
+func TestTLSRoutesCertificateImplicitAllowFail(t *testing.T) {
+	testTLSRoutesCertificateImplicitAllow(t, false)
+}
+
+func testTLSRoutesCertificateImplicitAllow(t *testing.T, pass bool) {
+	// Base config for the servers
+	cfg := createTempFile(t, "cfg")
+	cfg.WriteString(fmt.Sprintf(`
+		cluster {
+		  tls {
+			cert_file = "../test/configs/certs/tlsauth/server.pem"
+			key_file = "../test/configs/certs/tlsauth/server-key.pem"
+			ca_file = "../test/configs/certs/tlsauth/ca.pem"
+			verify_cert_and_check_known_urls = true
+			insecure = %t
+			timeout = 1
+		  }
+		}
+	`, !pass)) // set insecure to skip verification on the outgoing end
+	if err := cfg.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Close()
+
+	optsA := LoadConfig(cfg.Name())
+	optsB := LoadConfig(cfg.Name())
+
+	routeURLs := "nats://localhost:9935, nats://localhost:9936"
+	if !pass {
+		routeURLs = "nats://127.0.0.1:9935, nats://127.0.0.1:9936"
+	}
+	optsA.Host = "127.0.0.1"
+	optsA.Port = 9335
+	optsA.Cluster.Name = "xyz"
+	optsA.Cluster.Host = optsA.Host
+	optsA.Cluster.Port = 9935
+	optsA.Cluster.resolver = &localhostResolver{}
+	optsA.Routes = RoutesFromStr(routeURLs)
+	optsA.NoSystemAccount = true
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	optsB.Host = "127.0.0.1"
+	optsB.Port = 9336
+	optsB.Cluster.Name = "xyz"
+	optsB.Cluster.Host = optsB.Host
+	optsB.Cluster.Port = 9936
+	optsB.Cluster.resolver = &localhostResolver{}
+	optsB.Routes = RoutesFromStr(routeURLs)
+	optsB.NoSystemAccount = true
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	if pass {
+		checkNumRoutes(t, srvA, 1)
+		checkNumRoutes(t, srvB, 1)
+	} else {
+		time.Sleep(1 * time.Second) // the fail case uses the IP, so a short wait is sufficient
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			if srvA.NumRoutes() != 0 || srvB.NumRoutes() != 0 {
+				return fmt.Errorf("No route connection expected")
+			}
+			return nil
+		})
+	}
+}
+
+func TestSubjectRenameViaJetStreamAck(t *testing.T) {
+	s := RunRandClientPortServer()
+	defer s.Shutdown()
+	errChan := make(chan error)
+	defer close(errChan)
+	ncPub := natsConnect(t, s.ClientURL(), nats.UserInfo("client", "pwd"),
+		nats.ErrorHandler(func(conn *nats.Conn, s *nats.Subscription, err error) {
+			errChan <- err
+		}))
+	defer ncPub.Close()
+	require_NoError(t, ncPub.PublishRequest("SVC.ALLOWED", "$JS.ACK.whatever@ADMIN", nil))
+	select {
+	case err := <-errChan:
+		require_Contains(t, err.Error(), "Permissions Violation for Publish with Reply of")
+	case <-time.After(time.Second):
+		t.Fatalf("Expected error")
+	}
+}
+
+func TestClusterQueueGroupWeightTrackingLeak(t *testing.T) {
+	o := DefaultOptions()
+	o.ServerName = "A"
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.ServerName = "B"
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	// Create a queue subscription
+	sub := natsQueueSubSync(t, nc, "foo", "bar")
+
+	// Check on s0 that we have the proper queue weight info
+	acc := s.GlobalAccount()
+
+	check := func(present bool, expected int32) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			acc.mu.RLock()
+			v, ok := acc.lqws["foo bar"]
+			acc.mu.RUnlock()
+			if present {
+				if !ok {
+					return fmt.Errorf("the key is not present")
+				}
+				if v != expected {
+					return fmt.Errorf("lqws doest not contain expected value of %v: %v", expected, v)
+				}
+			} else if ok {
+				return fmt.Errorf("the key is present with value %v and should not be", v)
+			}
+			return nil
+		})
+	}
+	check(true, 1)
+
+	// Now unsub, and it should be removed, not just be 0
+	sub.Unsubscribe()
+	check(false, 0)
+
+	// Still make sure that the subject interest is gone from both servers.
+	checkSubGone := func(s *Server) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			acc := s.GlobalAccount()
+			acc.mu.RLock()
+			res := acc.sl.Match("foo")
+			acc.mu.RUnlock()
+			if res != nil && len(res.qsubs) > 0 {
+				return fmt.Errorf("Found queue sub on foo for server %v", s)
+			}
+			return nil
+		})
+	}
+	checkSubGone(s)
+	checkSubGone(s2)
+}
+
+type testRouteReconnectLogger struct {
+	DummyLogger
+	ch chan string
+}
+
+func (l *testRouteReconnectLogger) Debugf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	if strings.Contains(msg, "Trying to connect to route") {
+		select {
+		case l.ch <- msg:
+		default:
+		}
+	}
+}
+
+func TestRouteSolicitedReconnectsEvenIfImplicit(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.ServerName = "A"
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.ServerName = "B"
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	// Not strictly required to reconnect, but if the reconnect were to fail for any reason
+	// then the server would retry only once and then stops. So set it to some higher value
+	// and then we will check that the server does not try more than that.
+	o2.Cluster.ConnectRetries = 3
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	o3 := DefaultOptions()
+	o3.ServerName = "C"
+	o3.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	o3.Cluster.ConnectRetries = 3
+	s3 := RunServer(o3)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	s2.mu.Lock()
+	for _, r := range s2.routes {
+		r.mu.Lock()
+		// Close the route between S2 and S3 (that do not have explicit route to each other)
+		if r.route.remoteID == s3.ID() {
+			r.nc.Close()
+		}
+		r.mu.Unlock()
+	}
+	s2.mu.Unlock()
+	// Wait a bit to make sure that we don't check for cluster formed too soon (need to make
+	// sure that connection is really removed and reconnect mechanism starts).
+	time.Sleep(100 * time.Millisecond)
+	checkClusterFormed(t, s1, s2, s3)
+
+	// Now shutdown server 3 and make sure that s2 stops trying to reconnect to s3 at one point
+	l := &testRouteReconnectLogger{ch: make(chan string, 10)}
+	s2.SetLogger(l, true, false)
+	s3.Shutdown()
+	// S2 should retry ConnectRetries+1 times and then stop
+	for i := 0; i < o2.Cluster.ConnectRetries+1; i++ {
+		select {
+		case <-l.ch:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Did not attempt to reconnect")
+		}
+	}
+	// Now it should have stopped (in tests, reconnect delay is down to 15ms, so we don't need
+	// to wait for too long).
+	select {
+	case msg := <-l.ch:
+		t.Fatalf("Unexpected attempt to reconnect: %s", msg)
+	case <-time.After(50 * time.Millisecond):
+		// OK
+	}
+}
+
+func TestRouteSaveTLSName(t *testing.T) {
+	c1Conf := createConfFile(t, []byte(`
+		port: -1
+		cluster {
+			name: "abc"
+			port: -1
+			tls {
+				cert_file: '../test/configs/certs/server-noip.pem'
+				key_file: '../test/configs/certs/server-key-noip.pem'
+				ca_file: '../test/configs/certs/ca.pem'
+			}
+		}
+	`))
+	s1, o1 := RunServerWithConfig(c1Conf)
+	defer s1.Shutdown()
+
+	tmpl := `
+	port: -1
+	cluster {
+		name: "abc"
+		port: -1
+		routes: ["nats://%s:%d"]
+		tls {
+			cert_file: '../test/configs/certs/server-noip.pem'
+			key_file: '../test/configs/certs/server-key-noip.pem'
+			ca_file: '../test/configs/certs/ca.pem'
+		}
+	}
+	`
+	c2And3Conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "localhost", o1.Cluster.Port)))
+	s2, _ := RunServerWithConfig(c2And3Conf)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	s3, _ := RunServerWithConfig(c2And3Conf)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	reloadUpdateConfig(t, s2, c2And3Conf, fmt.Sprintf(tmpl, "127.0.0.1", o1.Cluster.Port))
+
+	s2.mu.RLock()
+	for _, r := range s2.routes {
+		r.mu.Lock()
+		if r.route.routeType == Implicit {
+			r.nc.Close()
+		}
+		r.mu.Unlock()
+	}
+	s2.mu.RUnlock()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	// Set a logger to capture errors trying to connect after clearing
+	// the routeTLSName and causing a disconnect
+	l := &captureErrorLogger{errCh: make(chan string, 1)}
+	s2.SetLogger(l, false, false)
+
+	var gotIt bool
+	for i := 0; !gotIt && i < 5; i++ {
+		s2.mu.Lock()
+		s2.routeTLSName = _EMPTY_
+		for _, r := range s2.routes {
+			r.mu.Lock()
+			if r.route.routeType == Implicit {
+				r.nc.Close()
+			}
+			r.mu.Unlock()
+		}
+		s2.mu.Unlock()
+		select {
+		case <-l.errCh:
+			gotIt = true
+		case <-time.After(time.Second):
+			// Try again
+		}
+	}
+	if !gotIt {
+		t.Fatal("Did not get the handshake error")
+	}
+
+	// Now get back to localhost in config and reload config and
+	// it should start to work again.
+	reloadUpdateConfig(t, s2, c2And3Conf, fmt.Sprintf(tmpl, "localhost", o1.Cluster.Port))
+	checkClusterFormed(t, s1, s2, s3)
 }

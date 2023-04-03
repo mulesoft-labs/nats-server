@@ -122,6 +122,16 @@ func TestEnvVariableStringStartingWithNumber(t *testing.T) {
 	}
 }
 
+func TestEnvVariableStringStartingWithNumberAndSizeUnit(t *testing.T) {
+	ex := map[string]interface{}{
+		"foo": "3Gyz",
+	}
+	evar := "__UNIQ22__"
+	os.Setenv(evar, "3Gyz")
+	defer os.Unsetenv(evar)
+	test(t, fmt.Sprintf("foo = $%s", evar), ex)
+}
+
 func TestEnvVariableStringStartingWithNumberUsingQuotes(t *testing.T) {
 	ex := map[string]interface{}{
 		"foo": "3xyz",
@@ -142,20 +152,44 @@ func TestBcryptVariable(t *testing.T) {
 var easynum = `
 k = 8k
 kb = 4kb
+ki = 3ki
+kib = 4ki
 m = 1m
 mb = 2MB
+mi = 2Mi
+mib = 64MiB
 g = 2g
 gb = 22GB
+gi = 22Gi
+gib = 22GiB
+tb = 22TB
+ti = 22Ti
+tib = 22TiB
+pb = 22PB
+pi = 22Pi
+pib = 22PiB
 `
 
 func TestConvenientNumbers(t *testing.T) {
 	ex := map[string]interface{}{
-		"k":  int64(8 * 1000),
-		"kb": int64(4 * 1024),
-		"m":  int64(1000 * 1000),
-		"mb": int64(2 * 1024 * 1024),
-		"g":  int64(2 * 1000 * 1000 * 1000),
-		"gb": int64(22 * 1024 * 1024 * 1024),
+		"k":   int64(8 * 1000),
+		"kb":  int64(4 * 1024),
+		"ki":  int64(3 * 1024),
+		"kib": int64(4 * 1024),
+		"m":   int64(1000 * 1000),
+		"mb":  int64(2 * 1024 * 1024),
+		"mi":  int64(2 * 1024 * 1024),
+		"mib": int64(64 * 1024 * 1024),
+		"g":   int64(2 * 1000 * 1000 * 1000),
+		"gb":  int64(22 * 1024 * 1024 * 1024),
+		"gi":  int64(22 * 1024 * 1024 * 1024),
+		"gib": int64(22 * 1024 * 1024 * 1024),
+		"tb":  int64(22 * 1024 * 1024 * 1024 * 1024),
+		"ti":  int64(22 * 1024 * 1024 * 1024 * 1024),
+		"tib": int64(22 * 1024 * 1024 * 1024 * 1024),
+		"pb":  int64(22 * 1024 * 1024 * 1024 * 1024 * 1024),
+		"pi":  int64(22 * 1024 * 1024 * 1024 * 1024 * 1024),
+		"pib": int64(22 * 1024 * 1024 * 1024 * 1024 * 1024),
 	}
 	test(t, easynum, ex)
 }
@@ -358,4 +392,14 @@ func TestIncludeVariablesWithChecks(t *testing.T) {
 	expectKeyVal(t, m, "ALICE_PASS", "$2a$10$UHR6GhotWhpLsKtVP0/i6.Nh9.fuY73cWjLoJjb2sKT8KISBcUW5q", 2, 1)
 	expectKeyVal(t, m, "BOB_PASS", "$2a$11$dZM98SpGeI7dCFFGSpt.JObQcix8YHml4TBUZoge9R1uxnMIln5ly", 3, 1)
 	expectKeyVal(t, m, "CAROL_PASS", "foo", 6, 3)
+}
+
+func TestParserNoInfiniteLoop(t *testing.T) {
+	for _, test := range []string{`A@@Føøøø?˛ø:{øøøø˙˙`, `include "9/�`} {
+		if _, err := Parse(test); err == nil {
+			t.Fatal("expected an error")
+		} else if !strings.Contains(err.Error(), "Unexpected EOF") {
+			t.Fatal("expected unexpected eof error")
+		}
+	}
 }

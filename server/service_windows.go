@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/debug"
 )
 
 const (
@@ -110,15 +109,15 @@ func Run(server *Server) error {
 		server.Start()
 		return nil
 	}
-	run := svc.Run
-	isInteractive, err := svc.IsAnInteractiveSession()
+	isWindowsService, err := svc.IsWindowsService()
 	if err != nil {
 		return err
 	}
-	if isInteractive {
-		run = debug.Run
+	if !isWindowsService {
+		server.Start()
+		return nil
 	}
-	return run(serviceName, &winServiceWrapper{server})
+	return svc.Run(serviceName, &winServiceWrapper{server})
 }
 
 // isWindowsService indicates if NATS is running as a Windows service.
@@ -126,6 +125,6 @@ func isWindowsService() bool {
 	if dockerized {
 		return false
 	}
-	isInteractive, _ := svc.IsAnInteractiveSession()
-	return !isInteractive
+	isWindowsService, _ := svc.IsWindowsService()
+	return isWindowsService
 }

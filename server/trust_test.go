@@ -15,7 +15,6 @@ package server
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 )
@@ -85,7 +84,6 @@ func TestTrustedKeysOptions(t *testing.T) {
 
 func TestTrustConfigOption(t *testing.T) {
 	confFileName := createConfFile(t, []byte(fmt.Sprintf("trusted = %q", t1)))
-	defer os.Remove(confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Error parsing config: %v", err)
@@ -98,7 +96,6 @@ func TestTrustConfigOption(t *testing.T) {
 	}
 
 	confFileName = createConfFile(t, []byte(fmt.Sprintf("trusted = [%q, %q]", t1, t2)))
-	defer os.Remove(confFileName)
 	opts, err = ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Error parsing config: %v", err)
@@ -115,7 +112,6 @@ func TestTrustConfigOption(t *testing.T) {
 
 	// Now do a bad one.
 	confFileName = createConfFile(t, []byte(fmt.Sprintf("trusted = [%q, %q]", t1, "bad")))
-	defer os.Remove(confFileName)
 	_, err = ProcessConfigFile(confFileName)
 	if err == nil {
 		t.Fatalf("Expected an error parsing trust keys with a bad key")

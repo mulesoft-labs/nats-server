@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows
 // +build !windows
 
 package logger
@@ -111,6 +112,8 @@ func TestRemoteSysLogger(t *testing.T) {
 	if !logger.trace {
 		t.Fatalf("Expected %t, received %t\n", true, logger.trace)
 	}
+	logger.Noticef("foo")
+	<-done
 }
 
 func TestRemoteSysLoggerNotice(t *testing.T) {

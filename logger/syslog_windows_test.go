@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build windows
 // +build windows
 
 package logger
@@ -30,7 +31,8 @@ func checkPrivledges(t *testing.T) {
 	defer eventlog.Remove(src)
 	if err := eventlog.InstallAsEventCreate(src, eventlog.Info|eventlog.Error|eventlog.Warning); err != nil {
 		if strings.Contains(err.Error(), "Access is denied") {
-			t.Skip("skipping:  elevated privledges are required.")
+			// Skip this test because elevated privileges are required.
+			t.SkipNow()
 		}
 		// let the tests report other types of errors
 	}

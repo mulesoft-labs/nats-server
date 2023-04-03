@@ -1,4 +1,4 @@
-// Copyright 2018-2019 The NATS Authors
+// Copyright 2018-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,18 +14,15 @@
 package test
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nuid"
 )
 
 func runNewRouteServer(t *testing.T) (*server.Server, *server.Options) {
@@ -53,6 +50,93 @@ func TestNewRouteInfoOnConnect(t *testing.T) {
 	if info.Nonce == "" {
 		t.Fatalf("Expected a non empty nonce in new route INFO")
 	}
+	// By default headers should be true.
+	if !info.Headers {
+		t.Fatalf("Expected to have headers on by default")
+	}
+	// Leafnode origin cluster support.
+	if !info.LNOC {
+		t.Fatalf("Expected to have leafnode origin cluster support")
+	}
+}
+
+func TestNewRouteHeaderSupport(t *testing.T) {
+	srvA, srvB, optsA, optsB := runServers(t)
+	defer srvA.Shutdown()
+	defer srvB.Shutdown()
+
+	clientA := createClientConn(t, optsA.Host, optsA.Port)
+	defer clientA.Close()
+
+	clientB := createClientConn(t, optsB.Host, optsB.Port)
+	defer clientB.Close()
+
+	sendA, expectA := setupHeaderConn(t, clientA)
+	sendA("SUB foo bar 22\r\n")
+	sendA("PING\r\n")
+	expectA(pongRe)
+
+	if err := checkExpectedSubs(1, srvA, srvB); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	sendB, expectB := setupHeaderConn(t, clientB)
+	// Can not have \r\n in payload fyi for regex.
+	sendB("HPUB foo reply 12 14\r\nK1:V1,K2:V2 ok\r\n")
+	sendB("PING\r\n")
+	expectB(pongRe)
+
+	expectHeaderMsgs := expectHeaderMsgsCommand(t, expectA)
+	matches := expectHeaderMsgs(1)
+	checkHmsg(t, matches[0], "foo", "22", "reply", "12", "14", "K1:V1,K2:V2 ", "ok")
+}
+
+func TestNewRouteHeaderSupportOldAndNew(t *testing.T) {
+	optsA := LoadConfig("./configs/srv_a.conf")
+	optsA.NoHeaderSupport = true
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	srvB, optsB := RunServerWithConfig("./configs/srv_b.conf")
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	clientA := createClientConn(t, optsA.Host, optsA.Port)
+	defer clientA.Close()
+
+	clientB := createClientConn(t, optsB.Host, optsB.Port)
+	defer clientB.Close()
+
+	sendA, expectA := setupHeaderConn(t, clientA)
+	sendA("SUB foo bar 22\r\n")
+	sendA("PING\r\n")
+	expectA(pongRe)
+
+	if err := checkExpectedSubs(1, srvA, srvB); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	sendB, expectB := setupHeaderConn(t, clientB)
+	// Can not have \r\n in payload fyi for regex.
+	sendB("HPUB foo reply 12 14\r\nK1:V1,K2:V2 ok\r\n")
+	sendB("PING\r\n")
+	expectB(pongRe)
+
+	expectMsgs := expectMsgsCommand(t, expectA)
+	matches := expectMsgs(1)
+	checkMsg(t, matches[0], "foo", "22", "reply", "2", "ok")
+}
+
+func sendRouteInfo(t *testing.T, rc net.Conn, routeSend sendFun, routeID string) {
+	info := checkInfoMsg(t, rc)
+	info.ID = routeID
+	info.Name = ""
+	b, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Could not marshal test route info: %v", err)
+	}
+	routeSend(fmt.Sprintf("INFO %s\r\n", b))
 }
 
 func TestNewRouteConnectSubs(t *testing.T) {
@@ -80,15 +164,7 @@ func TestNewRouteConnectSubs(t *testing.T) {
 	routeID := "RTEST_NEW:22"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
-
+	sendRouteInfo(t, rc, routeSend, routeID)
 	buf := routeExpect(rsubRe)
 
 	matches := rsubRe.FindAllSubmatch(buf, -1)
@@ -136,7 +212,7 @@ func TestNewRouteConnectSubsWithAccount(t *testing.T) {
 	c := createClientConn(t, opts.Host, opts.Port)
 	defer c.Close()
 
-	send, expect := setupConnWithAccount(t, c, accName)
+	send, expect := setupConnWithAccount(t, s, c, accName)
 
 	// Create 10 normal subs and 10 queue subscribers.
 	for i := 0; i < 10; i++ {
@@ -154,15 +230,7 @@ func TestNewRouteConnectSubsWithAccount(t *testing.T) {
 	routeID := "RTEST_NEW:22"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
-
+	sendRouteInfo(t, rc, routeSend, routeID)
 	buf := routeExpect(rsubRe)
 
 	matches := rsubRe.FindAllSubmatch(buf, -1)
@@ -215,7 +283,7 @@ func TestNewRouteRSubs(t *testing.T) {
 
 	// Create a client an account foo.
 	clientA := createClientConn(t, opts.Host, opts.Port)
-	sendA, expectA := setupConnWithAccount(t, clientA, "$foo")
+	sendA, expectA := setupConnWithAccount(t, s, clientA, "$foo")
 	defer clientA.Close()
 	sendA("PING\r\n")
 	expectA(pongRe)
@@ -234,13 +302,7 @@ func TestNewRouteRSubs(t *testing.T) {
 	routeID := "RTEST_NEW:33"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -250,7 +312,7 @@ func TestNewRouteRSubs(t *testing.T) {
 
 	// Now create a new client for account $bar and have them subscribe.
 	clientB := createClientConn(t, opts.Host, opts.Port)
-	sendB, expectB := setupConnWithAccount(t, clientB, "$bar")
+	sendB, expectB := setupConnWithAccount(t, s, clientB, "$bar")
 	defer clientB.Close()
 
 	sendB("PING\r\n")
@@ -312,13 +374,7 @@ func TestNewRouteProgressiveNormalSubs(t *testing.T) {
 	routeID := "RTEST_NEW:33"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -409,13 +465,7 @@ func TestNewRouteClientClosedWithNormalSubscriptions(t *testing.T) {
 	routeID := "RTEST_NEW:44"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -458,13 +508,7 @@ func TestNewRouteClientClosedWithQueueSubscriptions(t *testing.T) {
 	routeID := "RTEST_NEW:44"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -495,9 +539,6 @@ func TestNewRouteRUnsubAccountSpecific(t *testing.T) {
 	s, opts := runNewRouteServer(t)
 	defer s.Shutdown()
 
-	// Allow new accounts to be created on the fly.
-	opts.AllowNewAccounts = true
-
 	// Create a routeConn
 	rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
 	defer rc.Close()
@@ -505,17 +546,12 @@ func TestNewRouteRUnsubAccountSpecific(t *testing.T) {
 	routeID := "RTEST_NEW:77"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 
 	// Now create 500 subs on same subject but all different accounts.
 	for i := 0; i < 500; i++ {
 		account := fmt.Sprintf("$foo.account.%d", i)
+		s.RegisterAccount(account)
 		routeSend(fmt.Sprintf("RS+ %s foo\r\n", account))
 	}
 	routeSend("PING\r\n")
@@ -528,7 +564,7 @@ func TestNewRouteRUnsubAccountSpecific(t *testing.T) {
 	c := createClientConn(t, opts.Host, opts.Port)
 	defer c.Close()
 
-	send, expect := setupConnWithAccount(t, c, "$foo.account.22")
+	send, expect := setupConnWithAccount(t, s, c, "$foo.account.22")
 	send("PUB foo 2\r\nok\r\nPING\r\n")
 	expect(pongRe)
 	c.Close()
@@ -536,7 +572,7 @@ func TestNewRouteRUnsubAccountSpecific(t *testing.T) {
 	// But make sure we still receive on others
 	c = createClientConn(t, opts.Host, opts.Port)
 	defer c.Close()
-	send, expect = setupConnWithAccount(t, c, "$foo.account.33")
+	send, expect = setupConnWithAccount(t, s, c, "$foo.account.33")
 	send("PUB foo 2\r\nok\r\nPING\r\n")
 	expect(pongRe)
 
@@ -551,9 +587,6 @@ func TestNewRouteRSubCleanupOnDisconnect(t *testing.T) {
 	s, opts := runNewRouteServer(t)
 	defer s.Shutdown()
 
-	// Allow new accounts to be created on the fly.
-	opts.AllowNewAccounts = true
-
 	// Create a routeConn
 	rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
 	defer rc.Close()
@@ -561,13 +594,7 @@ func TestNewRouteRSubCleanupOnDisconnect(t *testing.T) {
 	routeID := "RTEST_NEW:77"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 
 	// Now create 100 subs on 3 different accounts.
 	for i := 0; i < 100; i++ {
@@ -599,13 +626,7 @@ func TestNewRouteSendSubsAndMsgs(t *testing.T) {
 	routeID := "RTEST_NEW:44"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -727,13 +748,7 @@ func TestNewRouteProcessRoutedMsgs(t *testing.T) {
 	routeID := "RTEST_NEW:55"
 	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 
-	info := checkInfoMsg(t, rc)
-	info.ID = routeID
-	b, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Could not marshal test route info: %v", err)
-	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	sendRouteInfo(t, rc, routeSend, routeID)
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -756,7 +771,7 @@ func TestNewRouteProcessRoutedMsgs(t *testing.T) {
 	matches := expectMsgs(1)
 	checkMsg(t, matches[0], "foo", "1", "", "2", "ok")
 
-	// Now send in a RMSG to the route witha reply and make sure its delivered to the client.
+	// Now send in a RMSG to the route with a reply and make sure its delivered to the client.
 	routeSend("RMSG $G foo reply 2\r\nok\r\nPING\r\n")
 	routeExpect(pongRe)
 
@@ -823,6 +838,11 @@ func TestNewRouteQueueSubsDistribution(t *testing.T) {
 	sendB("PING\r\n")
 	expectB(pongRe)
 
+	// Each server should have its 100 local subscriptions, plus 1 for the route.
+	if err := checkExpectedSubs(101, srvA, srvB); err != nil {
+		t.Fatal(err.Error())
+	}
+
 	sender := createClientConn(t, optsA.Host, optsA.Port)
 	defer sender.Close()
 	send, expect := setupConn(t, sender)
@@ -860,23 +880,26 @@ func TestNewRouteSinglePublishOnNewAccount(t *testing.T) {
 	defer srvA.Shutdown()
 	defer srvB.Shutdown()
 
-	// Allow new accounts to be created on the fly.
-	optsA.AllowNewAccounts = true
-	optsB.AllowNewAccounts = true
+	srvA.RegisterAccount("$TEST22")
+	srvB.RegisterAccount("$TEST22")
 
 	// Create and establish a listener on foo for $TEST22 account.
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
 	defer clientA.Close()
 
-	sendA, expectA := setupConnWithAccount(t, clientA, "$TEST22")
+	sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$TEST22")
 	sendA("SUB foo 1\r\nPING\r\n")
 	expectA(pongRe)
+
+	if err := checkExpectedSubs(1, srvB); err != nil {
+		t.Fatalf(err.Error())
+	}
 
 	clientB := createClientConn(t, optsB.Host, optsB.Port)
 	defer clientB.Close()
 
 	// Send a message, flush to make sure server processed and close connection.
-	sendB, expectB := setupConnWithAccount(t, clientB, "$TEST22")
+	sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$TEST22")
 	sendB("PUB foo 2\r\nok\r\nPING\r\n")
 	expectB(pongRe)
 	clientB.Close()
@@ -892,15 +915,14 @@ func TestNewRouteSinglePublishToQueueSubscriberOnNewAccount(t *testing.T) {
 	defer srvA.Shutdown()
 	defer srvB.Shutdown()
 
-	// Allow new accounts to be created on the fly.
-	optsA.AllowNewAccounts = true
-	optsB.AllowNewAccounts = true
+	srvA.RegisterAccount("$TEST22")
+	srvB.RegisterAccount("$TEST22")
 
 	// Create and establish a listener on foo for $TEST22 account.
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
 	defer clientA.Close()
 
-	sendA, expectA := setupConnWithAccount(t, clientA, "$TEST22")
+	sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$TEST22")
 	sendA("SUB foo bar 1\r\nPING\r\n")
 	expectA(pongRe)
 
@@ -908,7 +930,7 @@ func TestNewRouteSinglePublishToQueueSubscriberOnNewAccount(t *testing.T) {
 	defer clientB.Close()
 
 	// Send a message, flush to make sure server processed and close connection.
-	sendB, expectB := setupConnWithAccount(t, clientB, "$TEST22")
+	sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$TEST22")
 	sendB("PUB foo bar 2\r\nok\r\nPING\r\n")
 	expectB(pongRe)
 	defer clientB.Close()
@@ -930,23 +952,22 @@ func TestNewRouteSinglePublishToMultipleQueueSubscriberOnNewAccount(t *testing.T
 	defer srvB.Shutdown()
 	defer srvC.Shutdown()
 
-	// Allow new accounts to be created on the fly.
-	optsA.AllowNewAccounts = true
-	optsB.AllowNewAccounts = true
-	optsC.AllowNewAccounts = true
+	srvA.RegisterAccount("$TEST22")
+	srvB.RegisterAccount("$TEST22")
+	srvC.RegisterAccount("$TEST22")
 
 	// Create and establish a listener on foo/bar for $TEST22 account. Do this on ClientA and ClientC.
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
 	defer clientA.Close()
 
-	sendA, expectA := setupConnWithAccount(t, clientA, "$TEST22")
+	sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$TEST22")
 	sendA("SUB foo bar 11\r\nPING\r\n")
 	expectA(pongRe)
 
 	clientC := createClientConn(t, optsC.Host, optsC.Port)
 	defer clientC.Close()
 
-	sendC, expectC := setupConnWithAccount(t, clientC, "$TEST22")
+	sendC, expectC := setupConnWithAccount(t, srvC, clientC, "$TEST22")
 	sendC("SUB foo bar 33\r\nPING\r\n")
 	expectC(pongRe)
 
@@ -961,7 +982,7 @@ func TestNewRouteSinglePublishToMultipleQueueSubscriberOnNewAccount(t *testing.T
 	time.Sleep(100 * time.Millisecond)
 
 	// Send a message, flush to make sure server processed and close connection.
-	sendB, expectB := setupConnWithAccount(t, clientB, "$TEST22")
+	sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$TEST22")
 	sendB("PUB foo 2\r\nok\r\nPING\r\n")
 	expectB(pongRe)
 	defer clientB.Close()
@@ -1035,6 +1056,11 @@ func addServiceExport(subject string, authorized []*server.Account, targets ...*
 var isPublic = []*server.Account(nil)
 
 func TestNewRouteStreamImport(t *testing.T) {
+	testNewRouteStreamImport(t, false)
+}
+
+func testNewRouteStreamImport(t *testing.T, duplicateSub bool) {
+	t.Helper()
 	srvA, srvB, optsA, optsB := runServers(t)
 	defer srvA.Shutdown()
 	defer srvB.Shutdown()
@@ -1052,16 +1078,27 @@ func TestNewRouteStreamImport(t *testing.T) {
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
 	defer clientA.Close()
 
-	sendA, expectA := setupConnWithAccount(t, clientA, "$foo")
+	sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$foo")
 
 	// Now setup client B on srvB who will do a sub from account $bar
 	// that should map account $foo's foo subject.
 	clientB := createClientConn(t, optsB.Host, optsB.Port)
 	defer clientB.Close()
 
-	sendB, expectB := setupConnWithAccount(t, clientB, "$bar")
-	sendB("SUB foo 1\r\nPING\r\n")
+	sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$bar")
+	sendB("SUB foo 1\r\n")
+	if duplicateSub {
+		sendB("SUB foo 1\r\n")
+	}
+	sendB("PING\r\n")
 	expectB(pongRe)
+
+	// The subscription on "foo" for account $bar will also become
+	// a subscription on "foo" for account $foo due to import.
+	// So total of 2 subs.
+	if err := checkExpectedSubs(2, srvA); err != nil {
+		t.Fatalf(err.Error())
+	}
 
 	// Send on clientA
 	sendA("PING\r\n")
@@ -1083,6 +1120,10 @@ func TestNewRouteStreamImport(t *testing.T) {
 
 	sendB("UNSUB 1\r\nPING\r\n")
 	expectB(pongRe)
+
+	if err := checkExpectedSubs(0, srvA); err != nil {
+		t.Fatalf(err.Error())
+	}
 
 	sendA("PUB foo 2\r\nok\r\nPING\r\n")
 	expectA(pongRe)
@@ -1134,7 +1175,7 @@ func TestNewRouteStreamImportLargeFanout(t *testing.T) {
 	for i := 0; i < fanout; i++ {
 		clientB[i] = createClientConn(t, optsB.Host, optsB.Port)
 		defer clientB[i].Close()
-		sendB[i], expectB[i] = setupConnWithAccount(t, clientB[i], barA[i].Name)
+		sendB[i], expectB[i] = setupConnWithAccount(t, srvB, clientB[i], barA[i].Name)
 		sendB[i]("SUB foo 1\r\nPING\r\n")
 		expectB[i](pongRe)
 	}
@@ -1170,7 +1211,7 @@ func TestNewRouteReservedReply(t *testing.T) {
 
 func TestNewRouteServiceImport(t *testing.T) {
 	// To quickly enable trace and debug logging
-	// doLog, doTrace, doDebug = true, true, true
+	//doLog, doTrace, doDebug = true, true, true
 	srvA, srvB, optsA, optsB := runServers(t)
 	defer srvA.Shutdown()
 	defer srvB.Shutdown()
@@ -1203,7 +1244,7 @@ func TestNewRouteServiceImport(t *testing.T) {
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
 	defer clientA.Close()
 
-	sendA, expectA := setupConnWithAccount(t, clientA, "$foo")
+	sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$foo")
 	sendA("SUB test.request 1\r\nPING\r\n")
 	expectA(pongRe)
 
@@ -1212,9 +1253,14 @@ func TestNewRouteServiceImport(t *testing.T) {
 	clientB := createClientConn(t, optsB.Host, optsB.Port)
 	defer clientB.Close()
 
-	sendB, expectB := setupConnWithAccount(t, clientB, "$bar")
+	sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$bar")
 	sendB("SUB reply 1\r\nPING\r\n")
 	expectB(pongRe)
+
+	// Wait for all subs to be propagated. (1 on foo, 2 on bar)
+	if err := checkExpectedSubs(3, srvA, srvB); err != nil {
+		t.Fatal(err.Error())
+	}
 
 	// Send the request from clientB on foo.request,
 	sendB("PUB foo.request reply 2\r\nhi\r\nPING\r\n")
@@ -1237,8 +1283,9 @@ func TestNewRouteServiceImport(t *testing.T) {
 	matches = expectMsgsB(1)
 	checkMsg(t, matches[0], "reply", "1", "", "2", "ok")
 
-	if ts := fooA.TotalSubs(); ts != 1 {
-		t.Fatalf("Expected one sub to be left on fooA, but got %d", ts)
+	// This will be the responder and the wildcard for all service replies.
+	if ts := fooA.TotalSubs(); ts != 2 {
+		t.Fatalf("Expected two subs to be left on fooA, but got %d", ts)
 	}
 
 	routez, _ := srvA.Routez(&server.RoutezOptions{Subscriptions: true})
@@ -1246,8 +1293,8 @@ func TestNewRouteServiceImport(t *testing.T) {
 	if r == nil {
 		t.Fatalf("Expected 1 route, got none")
 	}
-	if r.NumSubs != 1 {
-		t.Fatalf("Expected 1 sub in the route connection, got %v", r.NumSubs)
+	if r.NumSubs != 2 {
+		t.Fatalf("Expected 2 subs in the route connection, got %v", r.NumSubs)
 	}
 }
 
@@ -1298,7 +1345,7 @@ func TestNewRouteServiceExportWithWildcards(t *testing.T) {
 			clientA := createClientConn(t, optsA.Host, optsA.Port)
 			defer clientA.Close()
 
-			sendA, expectA := setupConnWithAccount(t, clientA, "$foo")
+			sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$foo")
 			sendA("SUB ngs.update.* 1\r\nPING\r\n")
 			expectA(pongRe)
 
@@ -1307,9 +1354,14 @@ func TestNewRouteServiceExportWithWildcards(t *testing.T) {
 			clientB := createClientConn(t, optsB.Host, optsB.Port)
 			defer clientB.Close()
 
-			sendB, expectB := setupConnWithAccount(t, clientB, "$bar")
+			sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$bar")
 			sendB("SUB reply 1\r\nPING\r\n")
 			expectB(pongRe)
+
+			// Wait for all subs to be propagated. (1 on foo, 2 on bar)
+			if err := checkExpectedSubs(3, srvA, srvB); err != nil {
+				t.Fatal(err.Error())
+			}
 
 			// Send the request from clientB on foo.request,
 			sendB("PUB ngs.update reply 2\r\nhi\r\nPING\r\n")
@@ -1332,8 +1384,8 @@ func TestNewRouteServiceExportWithWildcards(t *testing.T) {
 			matches = expectMsgsB(1)
 			checkMsg(t, matches[0], "reply", "1", "", "2", "ok")
 
-			if ts := fooA.TotalSubs(); ts != 1 {
-				t.Fatalf("Expected one sub to be left on fooA, but got %d", ts)
+			if ts := fooA.TotalSubs(); ts != 2 {
+				t.Fatalf("Expected two subs to be left on fooA, but got %d", ts)
 			}
 
 			routez, _ := srvA.Routez(&server.RoutezOptions{Subscriptions: true})
@@ -1341,8 +1393,8 @@ func TestNewRouteServiceExportWithWildcards(t *testing.T) {
 			if r == nil {
 				t.Fatalf("Expected 1 route, got none")
 			}
-			if r.NumSubs != 1 {
-				t.Fatalf("Expected 1 sub in the route connection, got %v", r.NumSubs)
+			if r.NumSubs != 2 {
+				t.Fatalf("Expected 2 subs in the route connection, got %v", r.NumSubs)
 			}
 		})
 	}
@@ -1373,7 +1425,7 @@ func TestNewRouteServiceImportQueueGroups(t *testing.T) {
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
 	defer clientA.Close()
 
-	sendA, expectA := setupConnWithAccount(t, clientA, "$foo")
+	sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$foo")
 	sendA("SUB test.request QGROUP 1\r\nPING\r\n")
 	expectA(pongRe)
 
@@ -1382,9 +1434,14 @@ func TestNewRouteServiceImportQueueGroups(t *testing.T) {
 	clientB := createClientConn(t, optsB.Host, optsB.Port)
 	defer clientB.Close()
 
-	sendB, expectB := setupConnWithAccount(t, clientB, "$bar")
+	sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$bar")
 	sendB("SUB reply QGROUP_TOO 1\r\nPING\r\n")
 	expectB(pongRe)
+
+	// Wait for all subs to be propagated. (1 on foo, 2 on bar)
+	if err := checkExpectedSubs(3, srvA, srvB); err != nil {
+		t.Fatal(err.Error())
+	}
 
 	// Send the request from clientB on foo.request,
 	sendB("PUB foo.request reply 2\r\nhi\r\nPING\r\n")
@@ -1407,8 +1464,8 @@ func TestNewRouteServiceImportQueueGroups(t *testing.T) {
 	matches = expectMsgsB(1)
 	checkMsg(t, matches[0], "reply", "1", "", "2", "ok")
 
-	if ts := fooA.TotalSubs(); ts != 1 {
-		t.Fatalf("Expected one sub to be left on fooA, but got %d", ts)
+	if ts := fooA.TotalSubs(); ts != 2 {
+		t.Fatalf("Expected two subs to be left on fooA, but got %d", ts)
 	}
 
 	routez, _ := srvA.Routez(&server.RoutezOptions{Subscriptions: true})
@@ -1416,8 +1473,8 @@ func TestNewRouteServiceImportQueueGroups(t *testing.T) {
 	if r == nil {
 		t.Fatalf("Expected 1 route, got none")
 	}
-	if r.NumSubs != 1 {
-		t.Fatalf("Expected 1 sub in the route connection, got %v", r.NumSubs)
+	if r.NumSubs != 2 {
+		t.Fatalf("Expected 2 subs in the route connection, got %v", r.NumSubs)
 	}
 }
 
@@ -1429,8 +1486,6 @@ func TestNewRouteServiceImportDanglingRemoteSubs(t *testing.T) {
 	// Do Accounts for the servers.
 	fooA, _ := registerAccounts(t, srvA)
 	fooB, barB := registerAccounts(t, srvB)
-
-	fooA.SetAutoExpireTTL(10 * time.Millisecond)
 
 	// Add in the service export for the requests. Make it public.
 	if err := fooA.AddServiceExport("test.request", nil); err != nil {
@@ -1449,7 +1504,7 @@ func TestNewRouteServiceImportDanglingRemoteSubs(t *testing.T) {
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
 	defer clientA.Close()
 
-	sendA, expectA := setupConnWithAccount(t, clientA, "$foo")
+	sendA, expectA := setupConnWithAccount(t, srvA, clientA, "$foo")
 	// Express interest.
 	sendA("SUB test.request 1\r\nPING\r\n")
 	expectA(pongRe)
@@ -1459,9 +1514,19 @@ func TestNewRouteServiceImportDanglingRemoteSubs(t *testing.T) {
 	clientB := createClientConn(t, optsB.Host, optsB.Port)
 	defer clientB.Close()
 
-	sendB, expectB := setupConnWithAccount(t, clientB, "$bar")
+	sendB, expectB := setupConnWithAccount(t, srvB, clientB, "$bar")
 	sendB("SUB reply 1\r\nPING\r\n")
 	expectB(pongRe)
+
+	// Wait for all subs to be propagated (1 on foo and 1 on bar on srvA)
+	// (note that srvA is not importing)
+	if err := checkExpectedSubs(2, srvA); err != nil {
+		t.Fatal(err.Error())
+	}
+	// Wait for all subs to be propagated (1 on foo and 2 on bar)
+	if err := checkExpectedSubs(3, srvB); err != nil {
+		t.Fatal(err.Error())
+	}
 
 	// Send 100 requests from clientB on foo.request,
 	for i := 0; i < 100; i++ {
@@ -1490,8 +1555,8 @@ func TestNewRouteServiceImportDanglingRemoteSubs(t *testing.T) {
 	expectA(pongRe)
 
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if ts := fooA.TotalSubs(); ts != 0 {
-			return fmt.Errorf("Number of subs is %d, should be zero", ts)
+		if ts := fooA.TotalSubs(); ts != 1 {
+			return fmt.Errorf("Number of subs is %d, should be only 1", ts)
 		}
 		return nil
 	})
@@ -1603,123 +1668,157 @@ func TestNewRouteLargeDistinctQueueSubscribers(t *testing.T) {
 	})
 }
 
-func TestClusterLeaksSubscriptions(t *testing.T) {
-	srvA, srvB, optsA, optsB := runServers(t)
-	defer srvA.Shutdown()
-	defer srvB.Shutdown()
+func TestNewRouteLeafNodeOriginSupport(t *testing.T) {
+	content := `
+	listen: 127.0.0.1:-1
+	cluster { name: xyz, listen: 127.0.0.1:-1 }
+	leafnodes { listen: 127.0.0.1:-1 }
+	no_sys_acc: true
+	`
+	conf := createConfFile(t, []byte(content))
 
-	checkClusterFormed(t, srvA, srvB)
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
 
-	urlA := fmt.Sprintf("nats://%s:%d/", optsA.Host, optsA.Port)
-	urlB := fmt.Sprintf("nats://%s:%d/", optsB.Host, optsB.Port)
+	gacc, _ := s.LookupAccount("$G")
 
-	numResponses := 100
-	repliers := make([]*nats.Conn, 0, numResponses)
+	lcontent := `
+	listen: 127.0.0.1:-1
+	cluster { name: ln1, listen: 127.0.0.1:-1 }
+	leafnodes { remotes = [{ url: nats-leaf://127.0.0.1:%d }] }
+	no_sys_acc: true
+	`
+	lconf := createConfFile(t, []byte(fmt.Sprintf(lcontent, opts.LeafNode.Port)))
 
-	// Create 100 repliers
-	for i := 0; i < 50; i++ {
-		nc1, _ := nats.Connect(urlA)
-		nc2, _ := nats.Connect(urlB)
-		repliers = append(repliers, nc1, nc2)
-		nc1.Subscribe("test.reply", func(m *nats.Msg) {
-			m.Respond([]byte("{\"sender\": 22 }"))
-		})
-		nc2.Subscribe("test.reply", func(m *nats.Msg) {
-			m.Respond([]byte("{\"sender\": 33 }"))
-		})
-		nc1.Flush()
-		nc2.Flush()
+	ln, _ := RunServerWithConfig(lconf)
+	defer ln.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+
+	lgacc, _ := ln.LookupAccount("$G")
+
+	rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
+	defer rc.Close()
+
+	routeID := "LNOC:22"
+	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
+
+	pingPong := func() {
+		t.Helper()
+		routeSend("PING\r\n")
+		routeExpect(pongRe)
 	}
 
-	servers := fmt.Sprintf("%s, %s", urlA, urlB)
-	req := sizedBytes(8 * 1024)
-
-	// Now run a requestor in a loop, creating and tearing down each time to
-	// simulate running a modified nats-req.
-	doReq := func() {
-		msgs := make(chan *nats.Msg, 1)
-		inbox := nats.NewInbox()
-		grp := nuid.Next()
-		// Create 8 queue Subscribers for responses.
-		for i := 0; i < 8; i++ {
-			nc, _ := nats.Connect(servers)
-			nc.ChanQueueSubscribe(inbox, grp, msgs)
-			nc.Flush()
-			defer nc.Close()
-		}
-		nc, _ := nats.Connect(servers)
-		nc.PublishRequest("test.reply", inbox, req)
-		defer nc.Close()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		defer cancel()
-
-		var received int
-		for {
-			select {
-			case <-msgs:
-				received++
-				if received >= numResponses {
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
+	info := checkInfoMsg(t, rc)
+	info.ID = routeID
+	info.Name = ""
+	info.LNOC = true
+	b, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Could not marshal test route info: %v", err)
 	}
 
-	var wg sync.WaitGroup
+	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	routeExpect(rsubRe)
+	pingPong()
 
-	doRequests := func(n int) {
-		for i := 0; i < n; i++ {
-			doReq()
-		}
-		wg.Done()
+	// Make sure it can process and LS+
+	routeSend("LS+ ln1 $G foo\r\n")
+	pingPong()
+
+	if !gacc.SubscriptionInterest("foo") {
+		t.Fatalf("Expected interest on \"foo\"")
 	}
 
-	concurrent := 10
-	wg.Add(concurrent)
-	for i := 0; i < concurrent; i++ {
-		go doRequests(10)
-	}
-	wg.Wait()
-
-	// Close responders too, should have zero(0) subs attached to routes.
-	for _, nc := range repliers {
-		nc.Close()
+	// This should not have been sent to the leafnode since same origin cluster.
+	time.Sleep(10 * time.Millisecond)
+	if lgacc.SubscriptionInterest("foo") {
+		t.Fatalf("Did not expect interest on \"foo\"")
 	}
 
-	// Make sure no clients remain. This is to make sure the test is correct and that
-	// we have closed all the client connections.
+	// Create a connection on the leafnode server.
+	nc, err := nats.Connect(ln.ClientURL())
+	if err != nil {
+		t.Fatalf("Unexpected error connecting %v", err)
+	}
+	defer nc.Close()
+
+	sub, _ := nc.SubscribeSync("bar")
+	// Let it propagate to the main server
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		v1, _ := srvA.Varz(nil)
-		v2, _ := srvB.Varz(nil)
-		if v1.Connections != 0 || v2.Connections != 0 {
-			return fmt.Errorf("We have lingering client connections %d:%d", v1.Connections, v2.Connections)
+		if !gacc.SubscriptionInterest("bar") {
+			return fmt.Errorf("No interest")
 		}
 		return nil
 	})
+	// For "bar"
+	routeExpect(rlsubRe)
 
-	loadRoutez := func() (*server.Routez, *server.Routez) {
-		v1, err := srvA.Routez(&server.RoutezOptions{Subscriptions: true})
-		if err != nil {
-			t.Fatalf("Error getting Routez: %v", err)
-		}
-		v2, err := srvB.Routez(&server.RoutezOptions{Subscriptions: true})
-		if err != nil {
-			t.Fatalf("Error getting Routez: %v", err)
-		}
-		return v1, v2
+	// Now pretend like we send a message to the main server over the
+	// route but from the same origin cluster, should not be delivered
+	// to the leafnode.
+
+	// Make sure it can process and LMSG.
+	// LMSG for routes is like HMSG with an origin cluster before the account.
+	routeSend("LMSG ln1 $G bar 0 2\r\nok\r\n")
+	pingPong()
+
+	// Let it propagate if not properly truncated.
+	time.Sleep(10 * time.Millisecond)
+	if n, _, _ := sub.Pending(); n != 0 {
+		t.Fatalf("Should not have received the message on bar")
 	}
 
-	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		r1, r2 := loadRoutez()
-		if r1.Routes[0].NumSubs != 0 {
-			return fmt.Errorf("Leaked %d subs: %+v", r1.Routes[0].NumSubs, r1.Routes[0].Subs)
-		}
-		if r2.Routes[0].NumSubs != 0 {
-			return fmt.Errorf("Leaked %d subs: %+v", r2.Routes[0].NumSubs, r2.Routes[0].Subs)
-		}
-		return nil
-	})
+	// Try one with all the bells and whistles.
+	routeSend("LMSG ln1 $G foo + reply bar baz 0 2\r\nok\r\n")
+	pingPong()
+
+	// Let it propagate if not properly truncated.
+	time.Sleep(10 * time.Millisecond)
+	if n, _, _ := sub.Pending(); n != 0 {
+		t.Fatalf("Should not have received the message on bar")
+	}
+}
+
+// Check that real duplicate subscription (that is, sent by client with same sid)
+// are ignored and do not register multiple shadow subscriptions.
+func TestNewRouteDuplicateSubscription(t *testing.T) {
+	// This is same test than TestNewRouteStreamImport but calling "SUB foo 1" twice.
+	testNewRouteStreamImport(t, true)
+
+	opts := LoadConfig("./configs/new_cluster.conf")
+	opts.DisableShortFirstPing = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
+	defer rc.Close()
+
+	routeID := "RTEST_DUPLICATE:22"
+	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
+	sendRouteInfo(t, rc, routeSend, routeID)
+	routeSend("PING\r\n")
+	routeExpect(pongRe)
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+	send, expect := setupConn(t, c)
+
+	// Create a real duplicate subscriptions (same sid)
+	send("SUB foo 1\r\nSUB foo 1\r\nPING\r\n")
+	expect(pongRe)
+
+	// Route should receive single RS+
+	routeExpect(rsubRe)
+
+	// Unsubscribe.
+	send("UNSUB 1\r\nPING\r\n")
+	expect(pongRe)
+
+	// Route should receive RS-.
+	// With defect, only 1 subscription would be found during the unsubscribe,
+	// however route map would have been updated twice when processing the
+	// duplicate SUB, which means that the RS- would not be received because
+	// the count would still be 1.
+	routeExpect(runsubRe)
 }

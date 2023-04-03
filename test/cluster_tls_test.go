@@ -15,7 +15,7 @@ package test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -52,14 +52,14 @@ func TestBasicTLSClusterPubSub(t *testing.T) {
 	sendA("PING\r\n")
 	expectA(pongRe)
 
+	if err := checkExpectedSubs(1, srvA, srvB); err != nil {
+		t.Fatalf("%v", err)
+	}
+
 	sendB, expectB := setupConn(t, clientB)
 	sendB("PUB foo 2\r\nok\r\n")
 	sendB("PING\r\n")
 	expectB(pongRe)
-
-	if err := checkExpectedSubs(1, srvA, srvB); err != nil {
-		t.Fatalf("%v", err)
-	}
 
 	expectMsgs := expectMsgsCommand(t, expectA)
 
@@ -101,6 +101,7 @@ func TestClusterTLSInsecure(t *testing.T) {
 	confA := createConfFile(t, []byte(`
 		port: -1
 		cluster {
+			name: "xyz"
 			listen: "127.0.0.1:-1"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"
@@ -119,6 +120,7 @@ func TestClusterTLSInsecure(t *testing.T) {
 	bConfigTemplate := `
 		port: -1
 		cluster {
+			name: "xyz"
 			listen: "127.0.0.1:-1"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"
@@ -149,7 +151,7 @@ func TestClusterTLSInsecure(t *testing.T) {
 	srvB.SetLogger(wl, false, false)
 
 	// Need to add "insecure: true" and reload
-	if err := ioutil.WriteFile(confB,
+	if err := os.WriteFile(confB,
 		[]byte(fmt.Sprintf(bConfigTemplate, "insecure: true", optsA.Cluster.Host, optsA.Cluster.Port)),
 		0666); err != nil {
 		t.Fatalf("Error rewriting file: %v", err)

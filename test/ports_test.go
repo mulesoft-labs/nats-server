@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,7 +34,7 @@ func waitForFile(path string, dur time.Duration) ([]byte, error) {
 			time.Sleep(25 * time.Millisecond)
 			continue
 		} else {
-			return ioutil.ReadFile(path)
+			return os.ReadFile(path)
 		}
 	}
 	return nil, errors.New("Timeout")
@@ -46,7 +45,7 @@ func portFile(dirname string) string {
 }
 
 func TestPortsFile(t *testing.T) {
-	portFileDir := os.TempDir()
+	portFileDir := t.TempDir()
 
 	opts := DefaultTestOptions
 	opts.PortsFileDir = portFileDir
@@ -54,6 +53,12 @@ func TestPortsFile(t *testing.T) {
 	opts.HTTPPort = -1
 	opts.ProfPort = -1
 	opts.Cluster.Port = -1
+	opts.Websocket.Port = -1
+	tc := &server.TLSConfigOpts{
+		CertFile: "./configs/certs/server-cert.pem",
+		KeyFile:  "./configs/certs/server-key.pem",
+	}
+	opts.Websocket.TLSConfig, _ = server.GenTLSConfig(tc)
 
 	s := RunServer(&opts)
 	// this for test cleanup in case we fail - will be ignored if server already shutdown
@@ -100,6 +105,10 @@ func TestPortsFile(t *testing.T) {
 		t.Fatal("Expected at least one profile listen url")
 	}
 
+	if len(readPorts.WebSocket) == 0 || !strings.HasPrefix(readPorts.WebSocket[0], "wss://") {
+		t.Fatal("Expected at least one ws listen url")
+	}
+
 	// testing cleanup
 	s.Shutdown()
 	// if we called shutdown, the cleanup code should have kicked
@@ -113,12 +122,7 @@ func TestPortsFile(t *testing.T) {
 // makes a temp directory with two directories 'A' and 'B'
 // the location of the ports file is changed from dir A to dir B.
 func TestPortsFileReload(t *testing.T) {
-	// make a temp dir
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Error creating temp director (%s): %v", tempDir, err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// make child temp dir A
 	dirA := filepath.Join(tempDir, "A")
@@ -131,7 +135,7 @@ func TestPortsFileReload(t *testing.T) {
 	`, dirA)
 	config = strings.Replace(config, "\\", "/", -1)
 	confPath := filepath.Join(tempDir, fmt.Sprintf("%d.conf", os.Getpid()))
-	if err := ioutil.WriteFile(confPath, []byte(config), 0666); err != nil {
+	if err := os.WriteFile(confPath, []byte(config), 0666); err != nil {
 		t.Fatalf("Error writing ports file (%s): %v", confPath, err)
 	}
 
@@ -172,7 +176,7 @@ func TestPortsFileReload(t *testing.T) {
 		port: -1
 	`, dirB)
 	config = strings.Replace(config, "\\", "/", -1)
-	if err := ioutil.WriteFile(confPath, []byte(config), 0666); err != nil {
+	if err := os.WriteFile(confPath, []byte(config), 0666); err != nil {
 		t.Fatalf("Error writing ports file (%s): %v", confPath, err)
 	}
 

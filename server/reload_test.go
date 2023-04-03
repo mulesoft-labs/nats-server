@@ -1,4 +1,4 @@
-// Copyright 2017-2019 The NATS Authors
+// Copyright 2017-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,13 +14,16 @@
 package server
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -30,13 +33,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
 
 func newServerWithConfig(t *testing.T, configFile string) (*Server, *Options, string) {
 	t.Helper()
-	content, err := ioutil.ReadFile(configFile)
+	content, err := os.ReadFile(configFile)
 	if err != nil {
 		t.Fatalf("Error loading file: %v", err)
 	}
@@ -60,16 +64,12 @@ func newOptionsFromContent(t *testing.T, content []byte) (*Options, string) {
 	return opts, tmpFile
 }
 
-func createConfFile(t *testing.T, content []byte) string {
+func createConfFile(t testing.TB, content []byte) string {
 	t.Helper()
-	conf, err := ioutil.TempFile("", "")
-	if err != nil {
-		t.Fatalf("Error creating conf file: %v", err)
-	}
+	conf := createTempFile(t, "")
 	fName := conf.Name()
 	conf.Close()
-	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
-		os.Remove(fName)
+	if err := os.WriteFile(fName, content, 0666); err != nil {
 		t.Fatalf("Error writing conf file: %v", err)
 	}
 	return fName
@@ -77,7 +77,7 @@ func createConfFile(t *testing.T, content []byte) string {
 
 func runReloadServerWithConfig(t *testing.T, configFile string) (*Server, *Options, string) {
 	t.Helper()
-	content, err := ioutil.ReadFile(configFile)
+	content, err := os.ReadFile(configFile)
 	if err != nil {
 		t.Fatalf("Error loading file: %v", err)
 	}
@@ -95,7 +95,7 @@ func runReloadServerWithContent(t *testing.T, content []byte) (*Server, *Options
 
 func changeCurrentConfigContent(t *testing.T, curConfig, newConfig string) {
 	t.Helper()
-	content, err := ioutil.ReadFile(newConfig)
+	content, err := os.ReadFile(newConfig)
 	if err != nil {
 		t.Fatalf("Error loading file: %v", err)
 	}
@@ -104,7 +104,7 @@ func changeCurrentConfigContent(t *testing.T, curConfig, newConfig string) {
 
 func changeCurrentConfigContentWithNewContent(t *testing.T, curConfig string, content []byte) {
 	t.Helper()
-	if err := ioutil.WriteFile(curConfig, content, 0666); err != nil {
+	if err := os.WriteFile(curConfig, content, 0666); err != nil {
 		t.Fatalf("Error writing config: %v", err)
 	}
 }
@@ -126,7 +126,6 @@ func TestConfigReloadNoConfigFile(t *testing.T) {
 // does not support reloading.
 func TestConfigReloadUnsupported(t *testing.T) {
 	server, _, config := newServerWithConfig(t, "./configs/reload/test.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	loaded := server.ConfigTime()
@@ -135,7 +134,7 @@ func TestConfigReloadUnsupported(t *testing.T) {
 		ConfigFile:     config,
 		Host:           "0.0.0.0",
 		Port:           2233,
-		AuthTimeout:    1.0,
+		AuthTimeout:    float64(AUTH_TIMEOUT / time.Second),
 		Debug:          false,
 		Trace:          false,
 		Logtime:        false,
@@ -144,8 +143,9 @@ func TestConfigReloadUnsupported(t *testing.T) {
 		MaxConn:        65536,
 		PingInterval:   2 * time.Minute,
 		MaxPingsOut:    2,
-		WriteDeadline:  2 * time.Second,
+		WriteDeadline:  10 * time.Second,
 		Cluster: ClusterOpts{
+			Name: "abc",
 			Host: "127.0.0.1",
 			Port: -1,
 		},
@@ -176,7 +176,6 @@ func TestConfigReloadUnsupported(t *testing.T) {
 // server is changed to support change of listen spec).
 func TestConfigReloadUnsupportedHotSwapping(t *testing.T) {
 	server, _, config := newServerWithContent(t, []byte("listen: 127.0.0.1:-1"))
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	loaded := server.ConfigTime()
@@ -199,7 +198,6 @@ func TestConfigReloadUnsupportedHotSwapping(t *testing.T) {
 // Ensure Reload returns an error when reloading from a bad config file.
 func TestConfigReloadInvalidConfig(t *testing.T) {
 	server, _, config := newServerWithConfig(t, "./configs/reload/test.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	loaded := server.ConfigTime()
@@ -208,7 +206,7 @@ func TestConfigReloadInvalidConfig(t *testing.T) {
 		ConfigFile:     config,
 		Host:           "0.0.0.0",
 		Port:           2233,
-		AuthTimeout:    1.0,
+		AuthTimeout:    float64(AUTH_TIMEOUT / time.Second),
 		Debug:          false,
 		Trace:          false,
 		Logtime:        false,
@@ -217,8 +215,9 @@ func TestConfigReloadInvalidConfig(t *testing.T) {
 		MaxConn:        65536,
 		PingInterval:   2 * time.Minute,
 		MaxPingsOut:    2,
-		WriteDeadline:  2 * time.Second,
+		WriteDeadline:  10 * time.Second,
 		Cluster: ClusterOpts{
+			Name: "abc",
 			Host: "127.0.0.1",
 			Port: -1,
 		},
@@ -247,12 +246,10 @@ func TestConfigReloadInvalidConfig(t *testing.T) {
 // Ensure Reload returns nil and the config is changed on success.
 func TestConfigReload(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/test.conf")
-	defer os.Remove(config)
-	defer os.Remove("nats-server.pid")
-	defer os.Remove("nats-server.log")
+	defer removeFile(t, "nats-server.pid")
+	defer removeFile(t, "nats-server.log")
 	defer server.Shutdown()
 
-	dir := filepath.Dir(config)
 	var content []byte
 	if runtime.GOOS != "windows" {
 		content = []byte(`
@@ -260,9 +257,8 @@ func TestConfigReload(t *testing.T) {
 			syslog:        true # enable on reload
 		`)
 	}
-	platformConf := filepath.Join(dir, "platform.conf")
-	defer os.Remove(platformConf)
-	if err := ioutil.WriteFile(platformConf, content, 0666); err != nil {
+	platformConf := filepath.Join(filepath.Dir(config), "platform.conf")
+	if err := os.WriteFile(platformConf, content, 0666); err != nil {
 		t.Fatalf("Unable to write config file: %v", err)
 	}
 
@@ -272,7 +268,7 @@ func TestConfigReload(t *testing.T) {
 		ConfigFile:     config,
 		Host:           "0.0.0.0",
 		Port:           2233,
-		AuthTimeout:    1.0,
+		AuthTimeout:    float64(AUTH_TIMEOUT / time.Second),
 		Debug:          false,
 		Trace:          false,
 		NoLog:          true,
@@ -282,8 +278,9 @@ func TestConfigReload(t *testing.T) {
 		MaxConn:        65536,
 		PingInterval:   2 * time.Minute,
 		MaxPingsOut:    2,
-		WriteDeadline:  2 * time.Second,
+		WriteDeadline:  10 * time.Second,
 		Cluster: ClusterOpts{
+			Name: "abc",
 			Host: "127.0.0.1",
 			Port: server.ClusterAddr().Port,
 		},
@@ -376,7 +373,6 @@ func TestConfigReload(t *testing.T) {
 // ensure reconnect succeeds when the client provides a cert.
 func TestConfigReloadRotateTLS(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/tls_test.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -431,7 +427,6 @@ func TestConfigReloadRotateTLS(t *testing.T) {
 // reconnect fails, then ensure reconnect succeeds when using secure.
 func TestConfigReloadEnableTLS(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/basic.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -463,7 +458,6 @@ func TestConfigReloadEnableTLS(t *testing.T) {
 // without secure.
 func TestConfigReloadDisableTLS(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/tls_test.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -499,7 +493,6 @@ func TestConfigReloadDisableTLS(t *testing.T) {
 // then ensure reconnect succeeds when using the correct credentials.
 func TestConfigReloadRotateUserAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/single_user_authentication_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -562,7 +555,6 @@ func TestConfigReloadRotateUserAuthentication(t *testing.T) {
 // ensure reconnect succeeds when using the correct credentials.
 func TestConfigReloadEnableUserAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/basic.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -624,7 +616,6 @@ func TestConfigReloadEnableUserAuthentication(t *testing.T) {
 // with no credentials succeeds.
 func TestConfigReloadDisableUserAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/single_user_authentication_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -658,7 +649,6 @@ func TestConfigReloadDisableUserAuthentication(t *testing.T) {
 // ensure reconnect succeeds when using the correct token.
 func TestConfigReloadRotateTokenAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/token_authentication_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	disconnected := make(chan struct{})
@@ -716,7 +706,6 @@ func TestConfigReloadRotateTokenAuthentication(t *testing.T) {
 // succeeds when using the correct token.
 func TestConfigReloadEnableTokenAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/basic.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -778,7 +767,6 @@ func TestConfigReloadEnableTokenAuthentication(t *testing.T) {
 // with no token succeeds.
 func TestConfigReloadDisableTokenAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/token_authentication_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -812,7 +800,6 @@ func TestConfigReloadDisableTokenAuthentication(t *testing.T) {
 // ensure reconnect succeeds when using the correct credentials.
 func TestConfigReloadRotateUsersAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/multiple_users_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -900,7 +887,6 @@ func TestConfigReloadRotateUsersAuthentication(t *testing.T) {
 // succeeds when using the correct credentials.
 func TestConfigReloadEnableUsersAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/basic.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -962,7 +948,6 @@ func TestConfigReloadEnableUsersAuthentication(t *testing.T) {
 // with no credentials succeeds.
 func TestConfigReloadDisableUsersAuthentication(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/multiple_users_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -996,7 +981,6 @@ func TestConfigReloadDisableUsersAuthentication(t *testing.T) {
 // closed and publishes fail, then ensure the new permissions succeed.
 func TestConfigReloadChangePermissions(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/authorization_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	addr := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
@@ -1230,7 +1214,6 @@ func TestConfigReloadChangePermissions(t *testing.T) {
 // host.
 func TestConfigReloadClusterHostUnsupported(t *testing.T) {
 	server, _, config := runReloadServerWithConfig(t, "./configs/reload/srv_a_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Attempt to change cluster listen host.
@@ -1246,7 +1229,6 @@ func TestConfigReloadClusterHostUnsupported(t *testing.T) {
 // port.
 func TestConfigReloadClusterPortUnsupported(t *testing.T) {
 	server, _, config := runReloadServerWithConfig(t, "./configs/reload/srv_a_1.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Attempt to change cluster listen port.
@@ -1264,11 +1246,9 @@ func TestConfigReloadClusterPortUnsupported(t *testing.T) {
 // longer flow until reloading with the correct credentials.
 func TestConfigReloadEnableClusterAuthorization(t *testing.T) {
 	srvb, srvbOpts, srvbConfig := runReloadServerWithConfig(t, "./configs/reload/srv_b_1.conf")
-	defer os.Remove(srvbConfig)
 	defer srvb.Shutdown()
 
 	srva, srvaOpts, srvaConfig := runReloadServerWithConfig(t, "./configs/reload/srv_a_1.conf")
-	defer os.Remove(srvaConfig)
 	defer srva.Shutdown()
 
 	checkClusterFormed(t, srva, srvb)
@@ -1318,9 +1298,7 @@ func TestConfigReloadEnableClusterAuthorization(t *testing.T) {
 		t.Fatalf("Error reloading config: %v", err)
 	}
 
-	if numRoutes := srvb.NumRoutes(); numRoutes != 0 {
-		t.Fatalf("Expected 0 routes, got %d", numRoutes)
-	}
+	checkNumRoutes(t, srvb, 0)
 
 	// Ensure messages no longer flow through the cluster.
 	for i := 0; i < 5; i++ {
@@ -1335,7 +1313,6 @@ func TestConfigReloadEnableClusterAuthorization(t *testing.T) {
 
 	// Reload Server A with correct route credentials.
 	changeCurrentConfigContent(t, srvaConfig, "./configs/reload/srv_a_2.conf")
-	defer os.Remove(srvaConfig)
 	if err := srva.Reload(); err != nil {
 		t.Fatalf("Error reloading config: %v", err)
 	}
@@ -1365,11 +1342,9 @@ func TestConfigReloadEnableClusterAuthorization(t *testing.T) {
 // still flow.
 func TestConfigReloadDisableClusterAuthorization(t *testing.T) {
 	srvb, srvbOpts, srvbConfig := runReloadServerWithConfig(t, "./configs/reload/srv_b_2.conf")
-	defer os.Remove(srvbConfig)
 	defer srvb.Shutdown()
 
-	srva, srvaOpts, srvaConfig := runReloadServerWithConfig(t, "./configs/reload/srv_a_2.conf")
-	defer os.Remove(srvaConfig)
+	srva, srvaOpts, _ := runReloadServerWithConfig(t, "./configs/reload/srv_a_2.conf")
 	defer srva.Shutdown()
 
 	checkClusterFormed(t, srva, srvb)
@@ -1445,12 +1420,10 @@ func TestConfigReloadDisableClusterAuthorization(t *testing.T) {
 // reloading with a different route and ensuring messages flow through the new
 // cluster.
 func TestConfigReloadClusterRoutes(t *testing.T) {
-	srvb, srvbOpts, srvbConfig := runReloadServerWithConfig(t, "./configs/reload/srv_b_1.conf")
-	defer os.Remove(srvbConfig)
+	srvb, srvbOpts, _ := runReloadServerWithConfig(t, "./configs/reload/srv_b_1.conf")
 	defer srvb.Shutdown()
 
 	srva, srvaOpts, srvaConfig := runReloadServerWithConfig(t, "./configs/reload/srv_a_1.conf")
-	defer os.Remove(srvaConfig)
 	defer srva.Shutdown()
 
 	checkClusterFormed(t, srva, srvb)
@@ -1491,6 +1464,9 @@ func TestConfigReloadClusterRoutes(t *testing.T) {
 	if numRoutes := srvb.NumRoutes(); numRoutes != 1 {
 		t.Fatalf("Expected 1 route, got %d", numRoutes)
 	}
+
+	// Ensure consumer on srvA is propagated to srvB
+	checkExpectedSubs(t, 1, srvb)
 
 	// Ensure messages flow through the cluster as a sanity check.
 	if err := srvbConn.Publish("foo", []byte("hello")); err != nil {
@@ -1549,7 +1525,6 @@ func TestConfigReloadClusterRemoveSolicitedRoutes(t *testing.T) {
 	defer srvb.Shutdown()
 
 	srva, srvaOpts, srvaConfig := runReloadServerWithConfig(t, "./configs/reload/srv_a_1.conf")
-	defer os.Remove(srvaConfig)
 	defer srva.Shutdown()
 
 	checkClusterFormed(t, srva, srvb)
@@ -1568,6 +1543,7 @@ func TestConfigReloadClusterRemoveSolicitedRoutes(t *testing.T) {
 	if err := srvaConn.Flush(); err != nil {
 		t.Fatalf("Error flushing: %v", err)
 	}
+	checkExpectedSubs(t, 1, srvb)
 
 	srvbAddr := fmt.Sprintf("nats://%s:%d", srvbOpts.Host, srvbOpts.Port)
 	srvbConn, err := nats.Connect(srvbAddr)
@@ -1596,7 +1572,6 @@ func TestConfigReloadClusterRemoveSolicitedRoutes(t *testing.T) {
 
 	// Now change config for server A to not solicit a route to server B.
 	changeCurrentConfigContent(t, srvaConfig, "./configs/reload/srv_a_4.conf")
-	defer os.Remove(srvaConfig)
 	if err := srva.Reload(); err != nil {
 		t.Fatalf("Error reloading config: %v", err)
 	}
@@ -1622,7 +1597,7 @@ func TestConfigReloadClusterRemoveSolicitedRoutes(t *testing.T) {
 
 func reloadUpdateConfig(t *testing.T, s *Server, conf, content string) {
 	t.Helper()
-	if err := ioutil.WriteFile(conf, []byte(content), 0666); err != nil {
+	if err := os.WriteFile(conf, []byte(content), 0666); err != nil {
 		t.Fatalf("Error creating config file: %v", err)
 	}
 	if err := s.Reload(); err != nil {
@@ -1637,7 +1612,6 @@ func TestConfigReloadClusterAdvertise(t *testing.T) {
 			listen: "0.0.0.0:-1"
 		}
 	`))
-	defer os.Remove(conf)
 	defer s.Shutdown()
 
 	orgClusterPort := s.ClusterAddr().Port
@@ -1709,7 +1683,6 @@ func TestConfigReloadClusterNoAdvertise(t *testing.T) {
 			listen: "0.0.0.0:-1"
 		}
 	`))
-	defer os.Remove(conf)
 	defer s.Shutdown()
 
 	s.mu.Lock()
@@ -1752,12 +1725,38 @@ func TestConfigReloadClusterNoAdvertise(t *testing.T) {
 	}
 }
 
-func TestConfigReloadMaxSubsUnsupported(t *testing.T) {
-	s, _, conf := runReloadServerWithContent(t, []byte(`max_subs: 1`))
-	defer os.Remove(conf)
+func TestConfigReloadClusterName(t *testing.T) {
+	s, _, conf := runReloadServerWithContent(t, []byte(`
+		listen: "0.0.0.0:-1"
+		cluster: {
+			name: "abc"
+			listen: "0.0.0.0:-1"
+		}
+	`))
 	defer s.Shutdown()
 
-	if err := ioutil.WriteFile(conf, []byte(`max_subs: 10`), 0666); err != nil {
+	// Update config with a new cluster name.
+	reloadUpdateConfig(t, s, conf, `
+	listen: "0.0.0.0:-1"
+	cluster: {
+		name: "xyz"
+		listen: "0.0.0.0:-1"
+	}
+	`)
+
+	if s.ClusterName() != "xyz" {
+		t.Fatalf("Expected update clustername of \"xyz\", got %q", s.ClusterName())
+	}
+}
+
+func TestConfigReloadMaxSubsUnsupported(t *testing.T) {
+	s, _, conf := runReloadServerWithContent(t, []byte(`
+		port: -1
+		max_subs: 1
+		`))
+	defer s.Shutdown()
+
+	if err := os.WriteFile(conf, []byte(`max_subs: 10`), 0666); err != nil {
 		t.Fatalf("Error writing config file: %v", err)
 	}
 	if err := s.Reload(); err == nil {
@@ -1767,7 +1766,6 @@ func TestConfigReloadMaxSubsUnsupported(t *testing.T) {
 
 func TestConfigReloadClientAdvertise(t *testing.T) {
 	s, _, conf := runReloadServerWithContent(t, []byte(`listen: "0.0.0.0:-1"`))
-	defer os.Remove(conf)
 	defer s.Shutdown()
 
 	orgPort := s.Addr().(*net.TCPAddr).Port
@@ -1814,7 +1812,6 @@ func TestConfigReloadClientAdvertise(t *testing.T) {
 // max connections of one, and ensuring one client is disconnected.
 func TestConfigReloadMaxConnections(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/basic.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Make two connections.
@@ -1854,9 +1851,7 @@ func TestConfigReloadMaxConnections(t *testing.T) {
 		t.Fatal("Expected to be disconnected")
 	}
 
-	if numClients := server.NumClients(); numClients != 1 {
-		t.Fatalf("Expected 1 client, got %d", numClients)
-	}
+	checkClientsCount(t, server, 1)
 
 	// Ensure new connections fail.
 	_, err = nats.Connect(addr)
@@ -1871,7 +1866,6 @@ func TestConfigReloadMaxConnections(t *testing.T) {
 // and disconnects the client.
 func TestConfigReloadMaxPayload(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/basic.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	addr := fmt.Sprintf("nats://%s:%d", opts.Host, server.Addr().(*net.TCPAddr).Port)
@@ -1936,11 +1930,8 @@ func TestConfigReloadMaxPayload(t *testing.T) {
 func TestConfigReloadRotateFiles(t *testing.T) {
 	server, _, config := runReloadServerWithConfig(t, "./configs/reload/file_rotate.conf")
 	defer func() {
-		os.Remove(config)
-		os.Remove("log.txt")
-		os.Remove("nats-server.pid")
-		os.Remove("log1.txt")
-		os.Remove("nats-server1.pid")
+		removeFile(t, "log1.txt")
+		removeFile(t, "nats-server1.pid")
 	}()
 	defer server.Shutdown()
 
@@ -1972,12 +1963,8 @@ func TestConfigReloadRotateFiles(t *testing.T) {
 	}
 
 	// Check that the old files can be removed after rename.
-	if err := os.Remove("log_old.txt"); err != nil {
-		t.Fatalf("Error reloading config, cannot delete file: %v", err)
-	}
-	if err := os.Remove("nats-server_old.pid"); err != nil {
-		t.Fatalf("Error reloading config, cannot delete file: %v", err)
-	}
+	removeFile(t, "log_old.txt")
+	removeFile(t, "nats-server_old.pid")
 }
 
 func TestConfigReloadClusterWorks(t *testing.T) {
@@ -1995,7 +1982,6 @@ func TestConfigReloadClusterWorks(t *testing.T) {
 			]
 		}`
 	confB := createConfFile(t, []byte(fmt.Sprintf(confBTemplate, 3)))
-	defer os.Remove(confB)
 
 	confATemplate := `
 		listen: -1
@@ -2011,7 +1997,6 @@ func TestConfigReloadClusterWorks(t *testing.T) {
 			]
 		}`
 	confA := createConfFile(t, []byte(fmt.Sprintf(confATemplate, 3)))
-	defer os.Remove(confA)
 
 	srvb, _ := RunServerWithConfig(confB)
 	defer srvb.Shutdown()
@@ -2070,9 +2055,9 @@ func TestConfigReloadClusterPerms(t *testing.T) {
 				}
 			}
 		}
+		no_sys_acc: true
 	`
 	confA := createConfFile(t, []byte(fmt.Sprintf(confATemplate, `"foo"`, `"foo"`)))
-	defer os.Remove(confA)
 	srva, _ := RunServerWithConfig(confA)
 	defer srva.Shutdown()
 
@@ -2092,9 +2077,9 @@ func TestConfigReloadClusterPerms(t *testing.T) {
 				"nats://127.0.0.1:%d"
 			]
 		}
+		no_sys_acc: true
 	`
 	confB := createConfFile(t, []byte(fmt.Sprintf(confBTemplate, `"foo"`, `"foo"`, srva.ClusterAddr().Port)))
-	defer os.Remove(confB)
 	srvb, _ := RunServerWithConfig(confB)
 	defer srvb.Shutdown()
 
@@ -2228,6 +2213,7 @@ func TestConfigReloadClusterPerms(t *testing.T) {
 		cluster {
 			listen: 127.0.0.1:-1
 		}
+		no_sys_acc: true
 	`)
 	// Server A should now have baz sub
 	checkExpectedSubs(t, 5, srvb)
@@ -2247,6 +2233,7 @@ func TestConfigReloadClusterPerms(t *testing.T) {
 				"nats://127.0.0.1:%d"
 			]
 		}
+		no_sys_acc: true
 	`, srva.ClusterAddr().Port))
 	// Check expected subscriptions count.
 	checkExpectedSubs(t, 5, srvb)
@@ -2264,9 +2251,9 @@ func TestConfigReloadClusterPermsImport(t *testing.T) {
 				}
 			}
 		}
+		no_sys_acc: true
 	`
 	confA := createConfFile(t, []byte(fmt.Sprintf(confATemplate, `["foo", "bar"]`)))
-	defer os.Remove(confA)
 	srva, _ := RunServerWithConfig(confA)
 	defer srva.Shutdown()
 
@@ -2278,9 +2265,9 @@ func TestConfigReloadClusterPermsImport(t *testing.T) {
 				"nats://127.0.0.1:%d"
 			]
 		}
+		no_sys_acc: true
 	`
 	confB := createConfFile(t, []byte(fmt.Sprintf(confBTemplate, srva.ClusterAddr().Port)))
-	defer os.Remove(confB)
 	srvb, _ := RunServerWithConfig(confB)
 	defer srvb.Shutdown()
 
@@ -2320,6 +2307,7 @@ func TestConfigReloadClusterPermsImport(t *testing.T) {
 				export: ">"
 			}
 		}
+		no_sys_acc: true
 	`)
 	checkExpectedSubs(t, 2, srva, srvb)
 
@@ -2334,6 +2322,7 @@ func TestConfigReloadClusterPermsImport(t *testing.T) {
 				}
 			}
 		}
+		no_sys_acc: true
 	`
 	// Now deny all:
 	reloadUpdateConfig(t, srva, confA, fmt.Sprintf(confATemplate, `["foo", "bar"]`))
@@ -2357,9 +2346,9 @@ func TestConfigReloadClusterPermsExport(t *testing.T) {
 				}
 			}
 		}
+		no_sys_acc: true
 	`
 	confA := createConfFile(t, []byte(fmt.Sprintf(confATemplate, `["foo", "bar"]`)))
-	defer os.Remove(confA)
 	srva, _ := RunServerWithConfig(confA)
 	defer srva.Shutdown()
 
@@ -2371,9 +2360,9 @@ func TestConfigReloadClusterPermsExport(t *testing.T) {
 				"nats://127.0.0.1:%d"
 			]
 		}
+		no_sys_acc: true
 	`
 	confB := createConfFile(t, []byte(fmt.Sprintf(confBTemplate, srva.ClusterAddr().Port)))
-	defer os.Remove(confB)
 	srvb, _ := RunServerWithConfig(confB)
 	defer srvb.Shutdown()
 
@@ -2413,6 +2402,7 @@ func TestConfigReloadClusterPermsExport(t *testing.T) {
 				import: ">"
 			}
 		}
+		no_sys_acc: true
 	`)
 	checkExpectedSubs(t, 2, srva, srvb)
 
@@ -2427,6 +2417,7 @@ func TestConfigReloadClusterPermsExport(t *testing.T) {
 				}
 			}
 		}
+		no_sys_acc: true
 	`
 	// Now deny all:
 	reloadUpdateConfig(t, srva, confA, fmt.Sprintf(confATemplate, `["foo", "bar"]`))
@@ -2452,18 +2443,15 @@ func TestConfigReloadClusterPermsOldServer(t *testing.T) {
 		}
 	`
 	confA := createConfFile(t, []byte(fmt.Sprintf(confATemplate, `["foo", "bar"]`)))
-	defer os.Remove(confA)
 	srva, _ := RunServerWithConfig(confA)
 	defer srva.Shutdown()
 
 	optsB := DefaultOptions()
 	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srva.ClusterAddr().Port))
 	// Make server B behave like an old server
-	testRouteProto = RouteProtoZero
-	defer func() { testRouteProto = RouteProtoInfo }()
+	optsB.routeProto = setRouteProtoForTest(RouteProtoZero)
 	srvb := RunServer(optsB)
 	defer srvb.Shutdown()
-	testRouteProto = RouteProtoInfo
 
 	checkClusterFormed(t, srva, srvb)
 
@@ -2540,7 +2528,6 @@ func TestConfigReloadAccountUsers(t *testing.T) {
 		}
 	}
 	`))
-	defer os.Remove(conf)
 	s, opts := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -2725,7 +2712,6 @@ func TestConfigReloadAccountNKeyUsers(t *testing.T) {
 		}
 	}
 	`))
-	defer os.Remove(conf)
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -2739,6 +2725,7 @@ func TestConfigReloadAccountNKeyUsers(t *testing.T) {
 	pubKey, _ := kp.PublicKey()
 
 	c, cr, l := newClientForServer(s)
+	defer c.close()
 	// Check for Nonce
 	var info nonceInfo
 	if err := json.Unmarshal([]byte(l[5:]), &info); err != nil {
@@ -2755,7 +2742,7 @@ func TestConfigReloadAccountNKeyUsers(t *testing.T) {
 
 	// PING needed to flush the +OK to us.
 	cs := fmt.Sprintf("CONNECT {\"nkey\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", pubKey, sig)
-	go c.parse([]byte(cs))
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
@@ -2769,6 +2756,7 @@ func TestConfigReloadAccountNKeyUsers(t *testing.T) {
 	pubKey, _ = kp.PublicKey()
 
 	c, cr, l = newClientForServer(s)
+	defer c.close()
 	// Check for Nonce
 	err = json.Unmarshal([]byte(l[5:]), &info)
 	if err != nil {
@@ -2785,7 +2773,7 @@ func TestConfigReloadAccountNKeyUsers(t *testing.T) {
 
 	// PING needed to flush the +OK to us.
 	cs = fmt.Sprintf("CONNECT {\"nkey\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", pubKey, sig)
-	go c.parse([]byte(cs))
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
@@ -2861,6 +2849,7 @@ func TestConfigReloadAccountStreamsImportExport(t *testing.T) {
 			]
 		}
 	}
+	no_sys_acc: true
 	`
 	// synadia account exports "private.>" to nats.io
 	// synadia account exports "foo.*"
@@ -2868,7 +2857,6 @@ func TestConfigReloadAccountStreamsImportExport(t *testing.T) {
 	// nats.io account imports "foo.*" from synadia
 	// nats.io account imports "private.natsio.*" from synadia with prefix "ivan"
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, `"foo.*"`, `"xxx"`, `"foo.*"`, `"ivan"`)))
-	defer os.Remove(conf)
 	s, opts := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -3053,10 +3041,22 @@ func TestConfigReloadAccountServicesImportExport(t *testing.T) {
 			]
 		}
 	}
+	no_sys_acc: true
+	cluster {
+		name: "abc"
+		port: -1
+	}
 	`))
-	defer os.Remove(conf)
 	s, opts := RunServerWithConfig(conf)
 	defer s.Shutdown()
+
+	opts2 := DefaultOptions()
+	opts2.Cluster.Name = "abc"
+	opts2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", opts.Cluster.Port))
+	s2 := RunServer(opts2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s, s2)
 
 	derek, err := nats.Connect(fmt.Sprintf("nats://derek:foo@%s:%d", opts.Host, opts.Port))
 	if err != nil {
@@ -3101,6 +3101,9 @@ func TestConfigReloadAccountServicesImportExport(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Error on subscribe: %v", err)
 	}
+	// This subscription is just to make sure that we can update
+	// route map without locking issues during reload.
+	natsSubSync(t, ivan, "bar")
 
 	req := func(t *testing.T, nc *nats.Conn, subj string, reply string) {
 		t.Helper()
@@ -3118,7 +3121,7 @@ func TestConfigReloadAccountServicesImportExport(t *testing.T) {
 			if string(msg.Data) != reply {
 				t.Fatalf("Expected reply %s on subject %s, got %s", reply, subj, msg.Data)
 			}
-		} else if err != nats.ErrTimeout {
+		} else if err != nats.ErrTimeout && err != nats.ErrNoResponders {
 			t.Fatalf("Expected timeout on subject %s, got %v", subj, err)
 		}
 	}
@@ -3150,6 +3153,11 @@ func TestConfigReloadAccountServicesImportExport(t *testing.T) {
 				{service: {account: "synadia", subject: "pub.special.request.new"}, to: "baz"}
 			]
 		}
+	}
+	no_sys_acc: true
+	cluster {
+		name: "abc"
+		port: -1
 	}
 	`)
 	// This still should work
@@ -3186,9 +3194,9 @@ func TestConfigReloadNotPreventedByGateways(t *testing.T) {
 				}
 			]
 		}
+		no_sys_acc: true
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, "", "5")))
-	defer os.Remove(conf)
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -3205,11 +3213,10 @@ func TestConfigReloadNotPreventedByGateways(t *testing.T) {
 func TestConfigReloadBoolFlags(t *testing.T) {
 	defer func() { FlagSnapshot = nil }()
 
-	logfile := "logtime.log"
-	defer os.Remove(logfile)
+	logfile := filepath.Join(t.TempDir(), "logtime.log")
 	template := `
 		listen: "127.0.0.1:-1"
-		logfile: "logtime.log"
+		logfile: "%s"
 		%s
 	`
 
@@ -3564,10 +3571,33 @@ func TestConfigReloadBoolFlags(t *testing.T) {
 			false,
 			func() bool { return opts.Debug && opts.Trace },
 		},
+		{
+			"trace_verbose_true_in_config_override_true",
+			`trace_verbose: true
+			`,
+			nil,
+			true,
+			func() bool { return opts.Trace && opts.TraceVerbose },
+		},
+		{
+			"trace_verbose_true_in_config_override_false",
+			`trace_verbose: true
+			`,
+			[]string{"--VV=false"},
+			true,
+			func() bool { return !opts.TraceVerbose },
+		},
+		{
+			"trace_verbose_true_in_config_override_false",
+			`trace_verbose: false
+			`,
+			[]string{"--VV=true"},
+			true,
+			func() bool { return opts.TraceVerbose },
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			conf := createConfFile(t, []byte(fmt.Sprintf(template, test.content)))
-			defer os.Remove(conf)
+			conf := createConfFile(t, []byte(fmt.Sprintf(template, logfile, test.content)))
 
 			fs := flag.NewFlagSet("test", flag.ContinueOnError)
 			var args []string
@@ -3598,7 +3628,6 @@ func TestConfigReloadBoolFlags(t *testing.T) {
 
 func TestConfigReloadMaxControlLineWithClients(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/basic.conf")
-	defer os.Remove(config)
 	defer server.Shutdown()
 
 	// Ensure we can connect as a sanity check.
@@ -3649,7 +3678,6 @@ func TestConfigReloadIgnoreCustomAuth(t *testing.T) {
 	conf := createConfFile(t, []byte(`
 		port: -1
 	`))
-	defer os.Remove(conf)
 	opts := LoadConfig(conf)
 
 	ca := &testCustomAuth{}
@@ -3675,7 +3703,6 @@ func TestConfigReloadLeafNodeRandomPort(t *testing.T) {
 			port: -1
 		}
 	`))
-	defer os.Remove(conf)
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -3711,7 +3738,6 @@ func TestConfigReloadLeafNodeWithTLS(t *testing.T) {
 		}
 	`
 	conf1 := createConfFile(t, []byte(fmt.Sprintf(template, "")))
-	defer os.Remove(conf1)
 	s1, o1 := RunServerWithConfig(conf1)
 	defer s1.Shutdown()
 
@@ -3735,7 +3761,6 @@ func TestConfigReloadLeafNodeWithTLS(t *testing.T) {
 			]
 		}
 	`, u.String())))
-	defer os.Remove(conf2)
 	o2, err := ProcessConfigFile(conf2)
 	if err != nil {
 		t.Fatalf("Error processing config file: %v", err)
@@ -3759,13 +3784,52 @@ func TestConfigReloadLeafNodeWithTLS(t *testing.T) {
 	}
 }
 
+func TestConfigReloadLeafNodeWithRemotesNoChanges(t *testing.T) {
+	template := `
+        port: -1
+        cluster {
+            port: -1
+            name: "%s"
+        }
+        leaf {
+            remotes [
+                {
+                    urls: [
+                        "nats://127.0.0.1:1234",
+                        "nats://127.0.0.1:1235",
+                        "nats://127.0.0.1:1236",
+                        "nats://127.0.0.1:1237",
+                        "nats://127.0.0.1:1238",
+                        "nats://127.0.0.1:1239",
+                    ]
+                }
+            ]
+        }
+	`
+	config := fmt.Sprintf(template, "A")
+	conf := createConfFile(t, []byte(config))
+	o, err := ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	o.NoLog, o.NoSigs = true, false
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	config = fmt.Sprintf(template, "B")
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(config))
+
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error during reload: %v", err)
+	}
+}
+
 func TestConfigReloadAndVarz(t *testing.T) {
 	template := `
 		port: -1
 		%s
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, "")))
-	defer os.Remove(conf)
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -3806,7 +3870,6 @@ func TestConfigReloadConnectErrReports(t *testing.T) {
 		%s
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, "", "")))
-	defer os.Remove(conf)
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
@@ -3852,6 +3915,7 @@ func TestAuthReloadDoesNotBreakRouteInterest(t *testing.T) {
 
 	// Use this to check for message.
 	checkForMsg := func() {
+		t.Helper()
 		select {
 		case <-ch:
 		case <-time.After(2 * time.Second):
@@ -3868,6 +3932,7 @@ func TestAuthReloadDoesNotBreakRouteInterest(t *testing.T) {
 	defer sa.Shutdown()
 
 	checkClusterFormed(t, s, sa)
+	checkSubInterest(t, sa, globalAccountName, "foo", time.Second)
 
 	// Create second client and send message from this one. Interest should be here.
 	urlA := fmt.Sprintf("nats://%s:%d/", optsA.Host, optsA.Port)
@@ -3893,6 +3958,7 @@ func TestAuthReloadDoesNotBreakRouteInterest(t *testing.T) {
 	defer sa.Shutdown()
 
 	checkClusterFormed(t, s, sa)
+	checkSubInterest(t, sa, globalAccountName, "foo", time.Second)
 
 	nc2, err = nats.Connect(urlA)
 	if err != nil {
@@ -3903,4 +3969,542 @@ func TestAuthReloadDoesNotBreakRouteInterest(t *testing.T) {
 	// Check that we can still send messages.
 	nc2.Publish("foo", nil)
 	checkForMsg()
+}
+
+func TestConfigReloadAccountResolverTLSConfig(t *testing.T) {
+	kp, _ := nkeys.FromSeed(oSeed)
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(apub)
+	ajwt, err := nac.Encode(kp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+	pub, _ := kp.PublicKey()
+
+	tc := &TLSConfigOpts{
+		CertFile: "../test/configs/certs/server-cert.pem",
+		KeyFile:  "../test/configs/certs/server-key.pem",
+		CaFile:   "../test/configs/certs/ca.pem",
+	}
+	tlsConfig, err := GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating tls config: %v", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(ajwt))
+	}))
+	ts.TLS = tlsConfig
+	ts.StartTLS()
+	defer ts.Close()
+	// Set a dummy logger to prevent tls bad certificate output to stderr.
+	ts.Config.ErrorLog = log.New(&bytes.Buffer{}, "", 0)
+
+	confTemplate := `
+				listen: -1
+				trusted_keys: %s
+				resolver: URL("%s/ngs/v1/accounts/jwt/")
+				%s
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, pub, ts.URL, `
+		resolver_tls {
+			cert_file: "../test/configs/certs/client-cert.pem"
+			key_file: "../test/configs/certs/client-key.pem"
+			ca_file: "../test/configs/certs/ca.pem"
+		}
+	`)))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(confTemplate, pub, ts.URL, "")))
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error during reload: %v", err)
+	}
+
+	if _, err := s.LookupAccount(apub); err == nil {
+		t.Fatal("Expected error during lookup, did not get one")
+	}
+
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(confTemplate, pub, ts.URL, `
+		resolver_tls {
+			insecure: true
+		}
+	`)))
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error during reload: %v", err)
+	}
+
+	acc, err := s.LookupAccount(apub)
+	if err != nil {
+		t.Fatalf("Error during lookup: %v", err)
+	}
+	if acc == nil {
+		t.Fatalf("Expected to receive an account")
+	}
+	if acc.Name != apub {
+		t.Fatalf("Account name did not match claim key")
+	}
+}
+
+func TestLoggingReload(t *testing.T) {
+	// This test basically starts a server and causes it's configuration to be reloaded 3 times.
+	// Each time, a new log file is created and trace levels are turned, off - on - off.
+
+	// At the end of the test, all 3 log files are inspected for certain traces.
+	countMatches := func(log []byte, stmts ...string) int {
+		matchCnt := 0
+		for _, stmt := range stmts {
+			if strings.Contains(string(log), stmt) {
+				matchCnt++
+			}
+		}
+		return matchCnt
+	}
+
+	traces := []string{"[TRC]", "[DBG]", "SYSTEM", "MSG_PAYLOAD", "$SYS.SERVER.ACCOUNT"}
+
+	didTrace := func(log []byte) bool {
+		return countMatches(log, "[INF] Reloaded server configuration") == 1
+	}
+
+	tracingAbsent := func(log []byte) bool {
+		return countMatches(log, traces...) == 0 && didTrace(log)
+	}
+
+	tracingPresent := func(log []byte) bool {
+		return len(traces) == countMatches(log, traces...) && didTrace(log)
+	}
+
+	check := func(filename string, valid func([]byte) bool) {
+		t.Helper()
+		log, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatalf("Error reading log file %s: %v\n", filename, err)
+		}
+		if !valid(log) {
+			t.Fatalf("%s is not valid: %s", filename, log)
+		}
+		//t.Logf("%s contains: %s\n", filename, log)
+	}
+
+	// common configuration setting up system accounts. trace_verbose needs this to cause traces
+	commonCfg := `
+		port: -1
+		system_account: sys
+		accounts {
+		  sys { users = [ {user: sys, pass: "" } ] }
+		  nats.io: { users = [ { user : bar, pass: "pwd" } ] }
+		}
+	`
+
+	conf := createConfFile(t, []byte(commonCfg))
+
+	defer removeFile(t, "off-pre.log")
+	defer removeFile(t, "on.log")
+	defer removeFile(t, "off-post.log")
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	reload := func(change string) {
+		t.Helper()
+		changeCurrentConfigContentWithNewContent(t, conf, []byte(commonCfg+`
+			`+change+`
+		`))
+
+		if err := s.Reload(); err != nil {
+			t.Fatalf("Error during reload: %v", err)
+		}
+	}
+
+	traffic := func(cnt int) {
+		t.Helper()
+		// Create client and sub interest on server and create traffic
+		urlSeed := fmt.Sprintf("nats://bar:pwd@%s:%d/", opts.Host, opts.Port)
+		nc, err := nats.Connect(urlSeed)
+		if err != nil {
+			t.Fatalf("Error creating client: %v\n", err)
+		}
+		defer nc.Close()
+
+		msgs := make(chan *nats.Msg, 1)
+		defer close(msgs)
+
+		sub, err := nc.ChanSubscribe("foo", msgs)
+		if err != nil {
+			t.Fatalf("Error creating subscriber: %v\n", err)
+		}
+
+		nc.Flush()
+
+		for i := 0; i < cnt; i++ {
+			if err := nc.Publish("foo", []byte("bar")); err == nil {
+				<-msgs
+			}
+		}
+
+		sub.Unsubscribe()
+		nc.Close()
+	}
+
+	reload("log_file: off-pre.log")
+
+	traffic(10) // generate NO trace/debug entries in off-pre.log
+
+	reload(`
+		log_file: on.log
+		debug: true
+		trace_verbose: true
+	`)
+
+	traffic(10) // generate trace/debug entries in on.log
+
+	reload(`
+		log_file: off-post.log
+		debug: false
+		trace_verbose: false
+	`)
+
+	traffic(10) // generate trace/debug entries in off-post.log
+
+	// check resulting log files for expected content
+	check("off-pre.log", tracingAbsent)
+	check("on.log", tracingPresent)
+	check("off-post.log", tracingAbsent)
+}
+
+func TestReloadValidate(t *testing.T) {
+	confFileName := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		no_auth_user: a
+		authorization {
+			users [
+				{user: "a", password: "a"},
+				{user: "b", password: "b"}
+			]
+		}
+	`))
+	srv, _ := RunServerWithConfig(confFileName)
+	if srv == nil {
+		t.Fatal("Server did not start")
+	}
+	// Induce error by removing the user no_auth_user points to
+	changeCurrentConfigContentWithNewContent(t, confFileName, []byte(`
+		listen: "127.0.0.1:-1"
+		no_auth_user: a
+		authorization {
+			users [
+				{user: "b", password: "b"}
+			]
+		}
+	`))
+	if err := srv.Reload(); err == nil {
+		t.Fatal("Expected error on reload, got none")
+	} else if strings.HasPrefix(err.Error(), " no_auth_user:") {
+		t.Logf("Expected no_auth_user error, got different one %s", err)
+	}
+	srv.Shutdown()
+}
+
+func TestConfigReloadAccounts(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	listen: "127.0.0.1:-1"
+	system_account: SYS
+	accounts {
+		SYS {
+			users = [
+				{user: sys, password: pwd}
+			]
+		}
+		ACC {
+			users = [
+				{user: usr, password: pwd}
+			]
+		}
+		acc_deleted_after_reload_will_trigger_reload_of_all_accounts {
+			users = [
+				{user: notused, password: soon}
+			]
+		}
+	}
+	`))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	urlSys := fmt.Sprintf("nats://sys:pwd@%s:%d", o.Host, o.Port)
+	urlUsr := fmt.Sprintf("nats://usr:pwd@%s:%d", o.Host, o.Port)
+	oldAcc, ok := s.accounts.Load("SYS")
+	if !ok {
+		t.Fatal("No SYS account")
+	}
+
+	testSrvState := func(oldAcc interface{}) {
+		sysAcc := s.SystemAccount()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.sys == nil || sysAcc == nil {
+			t.Fatal("Expected sys.account to be non-nil")
+		}
+		if sysAcc.Name != "SYS" {
+			t.Fatal("Found wrong sys.account")
+		}
+		if s.opts.SystemAccount != "SYS" {
+			t.Fatal("Found wrong sys.account")
+		}
+		// This will fail prior to system account reload
+		if acc, ok := s.accounts.Load(s.opts.SystemAccount); !ok {
+			t.Fatal("Found different sys.account pointer")
+		} else if acc == oldAcc {
+			t.Fatal("System account is unaltered")
+		}
+		if s.sys.client == nil {
+			t.Fatal("Expected sys.client to be non-nil")
+		}
+		s.sys.client.mu.Lock()
+		defer s.sys.client.mu.Unlock()
+		if s.sys.client.acc.Name != "SYS" {
+			t.Fatal("Found wrong sys.account")
+		}
+		if s.sys.client.echo {
+			t.Fatal("Internal clients should always have echo false")
+		}
+		s.sys.account.mu.Lock()
+		if _, ok := s.sys.account.clients[s.sys.client]; !ok {
+			s.sys.account.mu.Unlock()
+			t.Fatal("internal client not present")
+		}
+		s.sys.account.mu.Unlock()
+	}
+
+	// Below tests use connection names so that they can be checked for.
+	// The test subscribes to ACC only. This avoids receiving own messages.
+	subscribe := func(name string) (*nats.Conn, *nats.Subscription, *nats.Subscription) {
+		t.Helper()
+		c, err := nats.Connect(urlSys, nats.Name(name))
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		subCon, err := c.SubscribeSync("$SYS.ACCOUNT.ACC.CONNECT")
+		if err != nil {
+			t.Fatalf("Error on subscribe CONNECT: %v", err)
+		}
+		subDis, err := c.SubscribeSync("$SYS.ACCOUNT.ACC.DISCONNECT")
+		if err != nil {
+			t.Fatalf("Error on subscribe DISCONNECT: %v", err)
+		}
+		c.Flush()
+		return c, subCon, subDis
+	}
+	recv := func(name string, sub *nats.Subscription) {
+		t.Helper()
+		if msg, err := sub.NextMsg(1 * time.Second); err != nil {
+			t.Fatalf("%s Error on next: %v", name, err)
+		} else {
+			cMsg := ConnectEventMsg{}
+			json.Unmarshal(msg.Data, &cMsg)
+			if cMsg.Client.Name != name {
+				t.Fatalf("%s wrong message: %s", name, string(msg.Data))
+			}
+		}
+	}
+	triggerSysEvent := func(name string, subs []*nats.Subscription) {
+		t.Helper()
+		ncs1, err := nats.Connect(urlUsr, nats.Name(name))
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		ncs1.Close()
+		for _, sub := range subs {
+			recv(name, sub)
+			// Make sure they are empty.
+			if pending, _, _ := sub.Pending(); pending != 0 {
+				t.Fatalf("Expected no pending, got %d for %+v", pending, sub)
+			}
+		}
+	}
+
+	testSrvState(nil)
+	c1, s1C, s1D := subscribe("SYS1")
+	defer c1.Close()
+	defer s1C.Unsubscribe()
+	defer s1D.Unsubscribe()
+	triggerSysEvent("BEFORE1", []*nats.Subscription{s1C, s1D})
+	triggerSysEvent("BEFORE2", []*nats.Subscription{s1C, s1D})
+
+	// Remove account to trigger account reload
+	reloadUpdateConfig(t, s, conf, `
+	listen: "127.0.0.1:-1"
+	system_account: SYS
+	accounts {
+		SYS {
+			users = [
+				{user: sys, password: pwd}
+			]
+		}
+		ACC {
+			users = [
+				{user: usr, password: pwd}
+			]
+		}
+	}
+	`)
+
+	testSrvState(oldAcc)
+	c2, s2C, s2D := subscribe("SYS2")
+	defer c2.Close()
+	defer s2C.Unsubscribe()
+	defer s2D.Unsubscribe()
+	// test new and existing subscriptions
+	triggerSysEvent("AFTER1", []*nats.Subscription{s1C, s1D, s2C, s2D})
+	triggerSysEvent("AFTER2", []*nats.Subscription{s1C, s1D, s2C, s2D})
+}
+
+func TestConfigReloadDefaultSystemAccount(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	listen: "127.0.0.1:-1"
+	accounts {
+		ACC {
+			users = [
+				{user: usr, password: pwd}
+			]
+		}
+	}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	sysAcc := s.SystemAccount()
+	if sysAcc == nil {
+		t.Fatalf("Expected system account to be present")
+	}
+	numSubs := sysAcc.TotalSubs()
+
+	sname := sysAcc.GetName()
+	testInAccounts := func() {
+		t.Helper()
+		var found bool
+		s.accounts.Range(func(k, v interface{}) bool {
+			acc := v.(*Account)
+			if acc.GetName() == sname {
+				found = true
+				return false
+			}
+			return true
+		})
+		if !found {
+			t.Fatalf("System account not found in accounts list")
+		}
+	}
+	testInAccounts()
+
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Unexpected error reloading: %v", err)
+	}
+
+	sysAcc = s.SystemAccount()
+	if sysAcc == nil {
+		t.Fatalf("Expected system account to still be present")
+	}
+	if sysAcc.TotalSubs() != numSubs {
+		t.Fatalf("Expected %d subs, got %d", numSubs, sysAcc.TotalSubs())
+	}
+	testInAccounts()
+}
+
+func TestConfigReloadAccountMappings(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	listen: "127.0.0.1:-1"
+	accounts {
+		ACC {
+			users = [{user: usr, password: pwd}]
+			mappings = { foo: bar }
+		}
+	}
+	`))
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	reloadUpdateConfig(t, s, conf, `
+	listen: "127.0.0.1:-1"
+	accounts {
+		ACC {
+			users = [{user: usr, password: pwd}]
+			mappings = { foo: baz }
+		}
+	}
+	`)
+
+	nc := natsConnect(t, fmt.Sprintf("nats://usr:pwd@%s:%d", opts.Host, opts.Port))
+	defer nc.Close()
+
+	fsub, _ := nc.SubscribeSync("foo")
+	sub, _ := nc.SubscribeSync("baz")
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+	checkPending(fsub, 0)
+	checkPending(sub, 1)
+
+	// Drain it off
+	if _, err := sub.NextMsg(2 * time.Second); err != nil {
+		t.Fatalf("Error receiving msg: %v", err)
+	}
+
+	reloadUpdateConfig(t, s, conf, `
+	listen: "127.0.0.1:-1"
+	accounts {
+		ACC {
+			users = [{user: usr, password: pwd}]
+		}
+	}
+	`)
+
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending(fsub, 1)
+	checkPending(sub, 0)
+}
+
+func TestConfigReloadWithSysAccountOnly(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		accounts {
+			$SYS {
+				users = [{user: "system",pass: "password"}, {user: "system2",pass: "password2"}]
+			}
+		}
+	`))
+	defer os.Remove(conf)
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	dch := make(chan struct{}, 1)
+	nc := natsConnect(t,
+		s.ClientURL(),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, _ error) {
+			dch <- struct{}{}
+		}),
+		nats.NoCallbacksAfterClientClose())
+	defer nc.Close()
+
+	// Just reload...
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error on reload: %v", err)
+	}
+
+	// Make sure we did not get disconnected
+	select {
+	case <-dch:
+		t.Fatal("Got disconnected!")
+	case <-time.After(500 * time.Millisecond):
+		// ok
+	}
 }

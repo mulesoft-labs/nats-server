@@ -1,4 +1,4 @@
-// Copyright 2018 The NATS Authors
+// Copyright 2018-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,14 +16,18 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
+	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
@@ -44,6 +48,60 @@ func simpleAccountServer(t *testing.T) (*Server, *Account, *Account) {
 	return s, f, b
 }
 
+func TestPlaceHolderIndex(t *testing.T) {
+	testString := "$1"
+	transformType, indexes, nbPartitions, _, err := indexPlaceHolders(testString)
+	var position int32
+
+	if err != nil || transformType != Wildcard || len(indexes) != 1 || indexes[0] != 1 || nbPartitions != -1 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{partition(10,1,2,3)}}"
+
+	transformType, indexes, nbPartitions, _, err = indexPlaceHolders(testString)
+
+	if err != nil || transformType != Partition || !reflect.DeepEqual(indexes, []int{1, 2, 3}) || nbPartitions != 10 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{ Partition (10,1,2,3) }}"
+
+	transformType, indexes, nbPartitions, _, err = indexPlaceHolders(testString)
+
+	if err != nil || transformType != Partition || !reflect.DeepEqual(indexes, []int{1, 2, 3}) || nbPartitions != 10 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{wildcard(2)}}"
+	transformType, indexes, nbPartitions, _, err = indexPlaceHolders(testString)
+
+	if err != nil || transformType != Wildcard || len(indexes) != 1 || indexes[0] != 2 || nbPartitions != -1 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{SplitFromLeft(2,1)}}"
+	transformType, indexes, position, _, err = indexPlaceHolders(testString)
+
+	if err != nil || transformType != SplitFromLeft || len(indexes) != 1 || indexes[0] != 2 || position != 1 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{SplitFromRight(3,2)}}"
+	transformType, indexes, position, _, err = indexPlaceHolders(testString)
+
+	if err != nil || transformType != SplitFromRight || len(indexes) != 1 || indexes[0] != 3 || position != 2 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+
+	testString = "{{SliceFromLeft(2,2)}}"
+	transformType, indexes, sliceSize, _, err := indexPlaceHolders(testString)
+
+	if err != nil || transformType != SliceFromLeft || len(indexes) != 1 || indexes[0] != 2 || sliceSize != 2 {
+		t.Fatalf("Error parsing %s", testString)
+	}
+}
+
 func TestRegisterDuplicateAccounts(t *testing.T) {
 	s, _, _ := simpleAccountServer(t)
 	if _, err := s.RegisterAccount("$foo"); err == nil {
@@ -54,10 +112,12 @@ func TestRegisterDuplicateAccounts(t *testing.T) {
 func TestAccountIsolation(t *testing.T) {
 	s, fooAcc, barAcc := simpleAccountServer(t)
 	cfoo, crFoo, _ := newClientForServer(s)
+	defer cfoo.close()
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error register client with 'foo' account: %v", err)
 	}
 	cbar, crBar, _ := newClientForServer(s)
+	defer cbar.close()
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error register client with 'bar' account: %v", err)
 	}
@@ -69,7 +129,7 @@ func TestAccountIsolation(t *testing.T) {
 
 	// Now do quick test that makes sure messages do not cross over.
 	// setup bar as a foo subscriber.
-	go cbar.parse([]byte("SUB foo 1\r\nPING\r\nPING\r\n"))
+	cbar.parseAsync("SUB foo 1\r\nPING\r\nPING\r\n")
 	l, err := crBar.ReadString('\n')
 	if err != nil {
 		t.Fatalf("Error for client 'bar' from server: %v", err)
@@ -78,7 +138,7 @@ func TestAccountIsolation(t *testing.T) {
 		t.Fatalf("PONG response incorrect: %q", l)
 	}
 
-	go cfoo.parse([]byte("SUB foo 1\r\nPUB foo 5\r\nhello\r\nPING\r\n"))
+	cfoo.parseAsync("SUB foo 1\r\nPUB foo 5\r\nhello\r\nPING\r\n")
 	l, err = crFoo.ReadString('\n')
 	if err != nil {
 		t.Fatalf("Error for client 'foo' from server: %v", err)
@@ -103,10 +163,286 @@ func TestAccountIsolation(t *testing.T) {
 	}
 }
 
+func TestAccountIsolationExportImport(t *testing.T) {
+	checkIsolation := func(t *testing.T, pubSubj string, ncExp, ncImp *nats.Conn) {
+		// We keep track of 2 subjects.
+		// One subject (pubSubj) is based off the stream import.
+		// The other subject "fizz" is not imported and should be isolated.
+
+		gotSubjs := map[string]int{
+			pubSubj: 0,
+			"fizz":  0,
+		}
+		count := int32(0)
+		ch := make(chan struct{}, 1)
+		if _, err := ncImp.Subscribe(">", func(m *nats.Msg) {
+			gotSubjs[m.Subject] += 1
+			if n := atomic.AddInt32(&count, 1); n == 3 {
+				ch <- struct{}{}
+			}
+		}); err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+		// Since both prod and cons use same server, flushing here will ensure
+		// that the interest is registered and known at the time we publish.
+		ncImp.Flush()
+
+		if err := ncExp.Publish(pubSubj, []byte(fmt.Sprintf("ncExp pub %s", pubSubj))); err != nil {
+			t.Fatal(err)
+		}
+		if err := ncImp.Publish(pubSubj, []byte(fmt.Sprintf("ncImp pub %s", pubSubj))); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := ncExp.Publish("fizz", []byte("ncExp pub fizz")); err != nil {
+			t.Fatal(err)
+		}
+		if err := ncImp.Publish("fizz", []byte("ncImp pub fizz")); err != nil {
+			t.Fatal(err)
+		}
+
+		wantSubjs := map[string]int{
+			// Subscriber ncImp should receive publishes from ncExp and ncImp.
+			pubSubj: 2,
+			// Subscriber ncImp should only receive the publish from ncImp.
+			"fizz": 1,
+		}
+
+		// Wait for at least the 3 expected messages
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("Expected 3 messages, got %v", atomic.LoadInt32(&count))
+		}
+		// But now wait a bit to see if subscription receives more than expected.
+		time.Sleep(50 * time.Millisecond)
+
+		if got, want := len(gotSubjs), len(wantSubjs); got != want {
+			t.Fatalf("unexpected subjs len, got=%d; want=%d", got, want)
+		}
+
+		for key, gotCnt := range gotSubjs {
+			if wantCnt := wantSubjs[key]; gotCnt != wantCnt {
+				t.Errorf("unexpected receive count for subject %q, got=%d, want=%d", key, gotCnt, wantCnt)
+			}
+		}
+	}
+
+	cases := []struct {
+		name     string
+		exp, imp string
+		pubSubj  string
+	}{
+		{
+			name: "export literal, import literal",
+			exp:  "foo", imp: "foo",
+			pubSubj: "foo",
+		},
+		{
+			name: "export full wildcard, import literal",
+			exp:  "foo.>", imp: "foo.bar",
+			pubSubj: "foo.bar",
+		},
+		{
+			name: "export full wildcard, import sublevel full wildcard",
+			exp:  "foo.>", imp: "foo.bar.>",
+			pubSubj: "foo.bar.whizz",
+		},
+		{
+			name: "export full wildcard, import full wildcard",
+			exp:  "foo.>", imp: "foo.>",
+			pubSubj: "foo.bar",
+		},
+		{
+			name: "export partial wildcard, import partial wildcard",
+			exp:  "foo.*", imp: "foo.*",
+			pubSubj: "foo.bar",
+		},
+		{
+			name: "export mid partial wildcard, import mid partial wildcard",
+			exp:  "foo.*.bar", imp: "foo.*.bar",
+			pubSubj: "foo.whizz.bar",
+		},
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%s jwt", c.name), func(t *testing.T) {
+			// Setup NATS server.
+			s := opTrustBasicSetup()
+			defer s.Shutdown()
+			go s.Start()
+			if err := s.readyForConnections(5 * time.Second); err != nil {
+				t.Fatal(err)
+			}
+			buildMemAccResolver(s)
+
+			// Setup exporter account.
+			accExpPair, accExpPub := createKey(t)
+			accExpClaims := jwt.NewAccountClaims(accExpPub)
+			if c.exp != "" {
+				accExpClaims.Limits.WildcardExports = true
+				accExpClaims.Exports.Add(&jwt.Export{
+					Name:    fmt.Sprintf("%s-stream-export", c.exp),
+					Subject: jwt.Subject(c.exp),
+					Type:    jwt.Stream,
+				})
+			}
+			accExpJWT, err := accExpClaims.Encode(oKp)
+			require_NoError(t, err)
+			addAccountToMemResolver(s, accExpPub, accExpJWT)
+
+			// Setup importer account.
+			accImpPair, accImpPub := createKey(t)
+			accImpClaims := jwt.NewAccountClaims(accImpPub)
+			if c.imp != "" {
+				accImpClaims.Imports.Add(&jwt.Import{
+					Name:    fmt.Sprintf("%s-stream-import", c.imp),
+					Subject: jwt.Subject(c.imp),
+					Account: accExpPub,
+					Type:    jwt.Stream,
+				})
+			}
+			accImpJWT, err := accImpClaims.Encode(oKp)
+			require_NoError(t, err)
+			addAccountToMemResolver(s, accImpPub, accImpJWT)
+
+			// Connect with different accounts.
+			ncExp := natsConnect(t, s.ClientURL(), createUserCreds(t, nil, accExpPair),
+				nats.Name(fmt.Sprintf("nc-exporter-%s", c.exp)))
+			defer ncExp.Close()
+			ncImp := natsConnect(t, s.ClientURL(), createUserCreds(t, nil, accImpPair),
+				nats.Name(fmt.Sprintf("nc-importer-%s", c.imp)))
+			defer ncImp.Close()
+
+			checkIsolation(t, c.pubSubj, ncExp, ncImp)
+			if t.Failed() {
+				t.Logf("exported=%q; imported=%q", c.exp, c.imp)
+			}
+		})
+
+		t.Run(fmt.Sprintf("%s conf", c.name), func(t *testing.T) {
+			// Setup NATS server.
+			cf := createConfFile(t, []byte(fmt.Sprintf(`
+				port: -1
+
+				accounts: {
+					accExp: {
+						users: [{user: accExp, password: accExp}]
+						exports: [{stream: %q}]
+					}
+					accImp: {
+						users: [{user: accImp, password: accImp}]
+						imports: [{stream: {account: accExp, subject: %q}}]
+					}
+				}
+			`,
+				c.exp, c.imp,
+			)))
+			s, _ := RunServerWithConfig(cf)
+			defer s.Shutdown()
+
+			// Connect with different accounts.
+			ncExp := natsConnect(t, s.ClientURL(), nats.UserInfo("accExp", "accExp"),
+				nats.Name(fmt.Sprintf("nc-exporter-%s", c.exp)))
+			defer ncExp.Close()
+			ncImp := natsConnect(t, s.ClientURL(), nats.UserInfo("accImp", "accImp"),
+				nats.Name(fmt.Sprintf("nc-importer-%s", c.imp)))
+			defer ncImp.Close()
+
+			checkIsolation(t, c.pubSubj, ncExp, ncImp)
+			if t.Failed() {
+				t.Logf("exported=%q; imported=%q", c.exp, c.imp)
+			}
+		})
+	}
+}
+
+func TestMultiAccountsIsolation(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	listen: 127.0.0.1:-1
+	accounts: {
+		PUBLIC: {
+			users:[{user: public, password: public}]
+			exports: [
+			  { stream: orders.client.stream.> }
+			  { stream: orders.client2.stream.> }
+			]
+		}
+		CLIENT: {
+			users:[{user: client, password: client}]
+			imports: [
+			  { stream: { account: PUBLIC, subject: orders.client.stream.> }}
+			]
+		}
+		CLIENT2: {
+			users:[{user: client2, password: client2}]
+			imports: [
+			  { stream: { account: PUBLIC, subject: orders.client2.stream.> }}
+			]
+		}
+	}`))
+
+	s, _ := RunServerWithConfig(conf)
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Create a connection for CLIENT and subscribe on orders.>
+	clientnc := natsConnect(t, s.ClientURL(), nats.UserInfo("client", "client"))
+	defer clientnc.Close()
+
+	clientsub := natsSubSync(t, clientnc, "orders.>")
+	natsFlush(t, clientnc)
+
+	// Now same for CLIENT2.
+	client2nc := natsConnect(t, s.ClientURL(), nats.UserInfo("client2", "client2"))
+	defer client2nc.Close()
+
+	client2sub := natsSubSync(t, client2nc, "orders.>")
+	natsFlush(t, client2nc)
+
+	// Now create a connection for PUBLIC
+	publicnc := natsConnect(t, s.ClientURL(), nats.UserInfo("public", "public"))
+	defer publicnc.Close()
+	// Publish on 'orders.client.stream.entry', so only CLIENT should receive it.
+	natsPub(t, publicnc, "orders.client.stream.entry", []byte("test1"))
+
+	// Verify that clientsub gets it.
+	msg := natsNexMsg(t, clientsub, time.Second)
+	require_Equal(t, string(msg.Data), "test1")
+
+	// And also verify that client2sub does NOT get it.
+	_, err := client2sub.NextMsg(100 * time.Microsecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	clientsub.Unsubscribe()
+	natsFlush(t, clientnc)
+	client2sub.Unsubscribe()
+	natsFlush(t, client2nc)
+
+	// Now have both accounts subscribe to "orders.*.stream.entry"
+	clientsub = natsSubSync(t, clientnc, "orders.*.stream.entry")
+	natsFlush(t, clientnc)
+
+	client2sub = natsSubSync(t, client2nc, "orders.*.stream.entry")
+	natsFlush(t, client2nc)
+
+	// Using the PUBLIC account, publish on the "CLIENT" subject
+	natsPub(t, publicnc, "orders.client.stream.entry", []byte("test2"))
+	natsFlush(t, publicnc)
+
+	msg = natsNexMsg(t, clientsub, time.Second)
+	require_Equal(t, string(msg.Data), "test2")
+
+	_, err = client2sub.NextMsg(100 * time.Microsecond)
+	require_Error(t, err, nats.ErrTimeout)
+}
+
 func TestAccountFromOptions(t *testing.T) {
 	opts := defaultServerOptions
 	opts.Accounts = []*Account{NewAccount("foo"), NewAccount("bar")}
 	s := New(&opts)
+	defer s.Shutdown()
 
 	ta := s.numReservedAccounts() + 2
 	if la := s.numAccounts(); la != ta {
@@ -123,151 +459,68 @@ func TestAccountFromOptions(t *testing.T) {
 	}
 }
 
-func TestNewAccountsFromClients(t *testing.T) {
-	opts := defaultServerOptions
-	s := New(&opts)
-
-	c, cr, _ := newClientForServer(s)
-	connectOp := []byte("CONNECT {\"account\":\"foo\"}\r\n")
-	go c.parse(connectOp)
-	l, _ := cr.ReadString('\n')
-	if !strings.HasPrefix(l, "-ERR ") {
-		t.Fatalf("Expected an error")
-	}
-
-	opts.AllowNewAccounts = true
-	s = New(&opts)
-
-	c, cr, _ = newClientForServer(s)
-	err := c.parse(connectOp)
-	if err != nil {
-		t.Fatalf("Received an error trying to connect: %v", err)
-	}
-	go c.parse([]byte("PING\r\n"))
-	l, err = cr.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Error reading response for client from server: %v", err)
-	}
-	if !strings.HasPrefix(l, "PONG\r\n") {
-		t.Fatalf("PONG response incorrect: %q", l)
-	}
-}
-
-func TestActiveAccounts(t *testing.T) {
-	opts := defaultServerOptions
-	opts.AllowNewAccounts = true
-	opts.Cluster.Port = 22
-
-	s := New(&opts)
-
-	if s.NumActiveAccounts() != 0 {
-		t.Fatalf("Expected no active accounts, got %d", s.NumActiveAccounts())
-	}
-
-	addClientWithAccount := func(accName string) *client {
-		t.Helper()
-		c, _, _ := newClientForServer(s)
-		connectOp := fmt.Sprintf("CONNECT {\"account\":\"%s\"}\r\n", accName)
-		err := c.parse([]byte(connectOp))
-		if err != nil {
-			t.Fatalf("Received an error trying to connect: %v", err)
+// Clients used to be able to ask that the account be forced to be new.
+// This was for dynamic sandboxes for demo environments but was never really used.
+// Make sure it always errors if set.
+func TestNewAccountAndRequireNewAlwaysError(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts: {
+			A: { users: [ {user: ua, password: pa} ] },
+			B: { users: [ {user: ub, password: pb} ] },
 		}
-		return c
-	}
+	`))
 
-	// Now add some clients.
-	cf1 := addClientWithAccount("foo")
-	if s.activeAccounts != 1 {
-		t.Fatalf("Expected active accounts to be 1, got %d", s.activeAccounts)
-	}
-	// Adding in same one should not change total.
-	cf2 := addClientWithAccount("foo")
-	if s.activeAccounts != 1 {
-		t.Fatalf("Expected active accounts to be 1, got %d", s.activeAccounts)
-	}
-	// Add in new one.
-	cb1 := addClientWithAccount("bar")
-	if s.activeAccounts != 2 {
-		t.Fatalf("Expected active accounts to be 2, got %d", s.activeAccounts)
-	}
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
 
-	// Make sure the Accounts track clients.
-	foo, _ := s.LookupAccount("foo")
-	bar, _ := s.LookupAccount("bar")
-	if foo == nil || bar == nil {
-		t.Fatalf("Error looking up accounts")
-	}
-	if nc := foo.NumConnections(); nc != 2 {
-		t.Fatalf("Expected account foo to have 2 clients, got %d", nc)
-	}
-	if nc := bar.NumConnections(); nc != 1 {
-		t.Fatalf("Expected account bar to have 1 client, got %d", nc)
-	}
+	// Success case
+	c, _, _ := newClientForServer(s)
+	connectOp := "CONNECT {\"user\":\"ua\", \"pass\":\"pa\"}\r\n"
+	err := c.parse([]byte(connectOp))
+	require_NoError(t, err)
+	c.close()
 
-	waitTilActiveCount := func(n int32) {
-		t.Helper()
-		checkFor(t, time.Second, 10*time.Millisecond, func() error {
-			if active := s.NumActiveAccounts(); active != n {
-				return fmt.Errorf("Number of active accounts is %d", active)
-			}
-			return nil
-		})
-	}
-
-	// Test Removal
-	cb1.closeConnection(ClientClosed)
-	waitTilActiveCount(1)
-
-	if nc := bar.NumConnections(); nc != 0 {
-		t.Fatalf("Expected account bar to have 0 clients, got %d", nc)
-	}
-
-	// This should not change the count.
-	cf1.closeConnection(ClientClosed)
-	waitTilActiveCount(1)
-
-	if nc := foo.NumConnections(); nc != 1 {
-		t.Fatalf("Expected account foo to have 1 client, got %d", nc)
-	}
-
-	cf2.closeConnection(ClientClosed)
-	waitTilActiveCount(0)
-
-	if nc := foo.NumConnections(); nc != 0 {
-		t.Fatalf("Expected account bar to have 0 clients, got %d", nc)
-	}
-}
-
-// Clients can ask that the account be forced to be new. If it exists this is an error.
-func TestNewAccountRequireNew(t *testing.T) {
-	// This has foo and bar accounts already.
-	s, _, _ := simpleAccountServer(t)
-
+	// Simple cases, any setting of account or new_account always errors.
+	// Even with proper auth.
 	c, cr, _ := newClientForServer(s)
-	connectOp := []byte("CONNECT {\"account\":\"foo\",\"new_account\":true}\r\n")
-	go c.parse(connectOp)
+	connectOp = "CONNECT {\"user\":\"ua\", \"pass\":\"pa\", \"account\":\"ANY\"}\r\n"
+	c.parseAsync(connectOp)
 	l, _ := cr.ReadString('\n')
-	if !strings.HasPrefix(l, "-ERR ") {
-		t.Fatalf("Expected an error")
+	if !strings.HasPrefix(l, "-ERR 'Authorization Violation'") {
+		t.Fatalf("Expected an error, got %q", l)
 	}
+	c.close()
 
-	// Now allow new accounts on the fly, make sure second time does not work.
-	opts := defaultServerOptions
-	opts.AllowNewAccounts = true
-	s = New(&opts)
-
-	c, _, _ = newClientForServer(s)
-	err := c.parse(connectOp)
-	if err != nil {
-		t.Fatalf("Received an error trying to create an account: %v", err)
-	}
-
+	// new_account with proper credentials.
 	c, cr, _ = newClientForServer(s)
-	go c.parse(connectOp)
+	connectOp = "CONNECT {\"user\":\"ua\", \"pass\":\"pa\", \"new_account\":true}\r\n"
+	c.parseAsync(connectOp)
 	l, _ = cr.ReadString('\n')
-	if !strings.HasPrefix(l, "-ERR ") {
-		t.Fatalf("Expected an error")
+	if !strings.HasPrefix(l, "-ERR 'Authorization Violation'") {
+		t.Fatalf("Expected an error, got %q", l)
 	}
+	c.close()
+
+	// switch acccounts with proper credentials.
+	c, cr, _ = newClientForServer(s)
+	connectOp = "CONNECT {\"user\":\"ua\", \"pass\":\"pa\", \"account\":\"B\"}\r\n"
+	c.parseAsync(connectOp)
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR 'Authorization Violation'") {
+		t.Fatalf("Expected an error, got %q", l)
+	}
+	c.close()
+
+	// Even if correct account designation, still make sure we error.
+	c, cr, _ = newClientForServer(s)
+	connectOp = "CONNECT {\"user\":\"ua\", \"pass\":\"pa\", \"account\":\"A\"}\r\n"
+	c.parseAsync(connectOp)
+	l, _ = cr.ReadString('\n')
+	if !strings.HasPrefix(l, "-ERR 'Authorization Violation'") {
+		t.Fatalf("Expected an error, got %q", l)
+	}
+	c.close()
 }
 
 func accountNameExists(name string, accounts []*Account) bool {
@@ -280,8 +533,11 @@ func accountNameExists(name string, accounts []*Account) bool {
 }
 
 func TestAccountSimpleConfig(t *testing.T) {
-	confFileName := createConfFile(t, []byte(`accounts = [foo, bar]`))
-	defer os.Remove(confFileName)
+	cfg1 := `
+		accounts = [foo, bar]
+	`
+
+	confFileName := createConfFile(t, []byte(cfg1))
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error processing config file: %v", err)
@@ -296,9 +552,12 @@ func TestAccountSimpleConfig(t *testing.T) {
 		t.Fatal("Expected a 'bar' account")
 	}
 
+	cfg2 := `
+		accounts = [foo, foo]
+	`
+
 	// Make sure double entries is an error.
-	confFileName = createConfFile(t, []byte(`accounts = [foo, foo]`))
-	defer os.Remove(confFileName)
+	confFileName = createConfFile(t, []byte(cfg2))
 	_, err = ProcessConfigFile(confFileName)
 	if err == nil {
 		t.Fatalf("Expected an error with double account entries")
@@ -322,7 +581,6 @@ func TestAccountParseConfig(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error processing config file: %v", err)
@@ -372,7 +630,6 @@ func TestAccountParseConfigDuplicateUsers(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(confFileName)
 	_, err := ProcessConfigFile(confFileName)
 	if err == nil {
 		t.Fatalf("Expected an error with double user entries")
@@ -382,7 +639,7 @@ func TestAccountParseConfigDuplicateUsers(t *testing.T) {
 func TestAccountParseConfigImportsExports(t *testing.T) {
 	opts, err := ProcessConfigFile("./configs/accounts.conf")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("parsing failed: ", err)
 	}
 	if la := len(opts.Accounts); la != 3 {
 		t.Fatalf("Expected to see 3 accounts in opts, got %d", la)
@@ -435,8 +692,8 @@ func TestAccountParseConfigImportsExports(t *testing.T) {
 	if ea == nil {
 		t.Fatalf("Expected to get a non-nil exportAuth for service")
 	}
-	if ea.respType != Stream {
-		t.Fatalf("Expected to get a Stream response type, got %q", ea.respType)
+	if ea.respType != Streamed {
+		t.Fatalf("Expected to get a Streamed response type, got %q", ea.respType)
 	}
 	ea = natsAcc.exports.services["nats.photo"]
 	if ea == nil {
@@ -480,7 +737,6 @@ func TestImportExportConfigFailures(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(cf)
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with import from unknown account")
 	}
@@ -492,7 +748,6 @@ func TestImportExportConfigFailures(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(cf)
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with import of a service with no account")
 	}
@@ -504,7 +759,6 @@ func TestImportExportConfigFailures(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(cf)
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with import of a service with wildcard subject")
 	}
@@ -516,7 +770,6 @@ func TestImportExportConfigFailures(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(cf)
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with export with unknown keyword")
 	}
@@ -528,7 +781,6 @@ func TestImportExportConfigFailures(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(cf)
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with import with unknown keyword")
 	}
@@ -540,7 +792,6 @@ func TestImportExportConfigFailures(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(cf)
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with export with account")
 	}
@@ -585,6 +836,31 @@ func TestImportAuthorized(t *testing.T) {
 	checkBool(foo.checkStreamImportAuthorized(bar, "*.*", nil), true, t)
 	checkBool(foo.checkStreamImportAuthorized(bar, "*.>", nil), true, t)
 
+	_, foo, bar = simpleAccountServer(t)
+	foo.addStreamExportWithAccountPos("foo.*", []*Account{}, 2)
+	foo.addStreamExportWithAccountPos("bar.*.foo", []*Account{}, 2)
+	if err := foo.addStreamExportWithAccountPos("baz.*.>", []*Account{}, 3); err == nil {
+		t.Fatal("expected error")
+	}
+	checkBool(foo.checkStreamImportAuthorized(bar, fmt.Sprintf("foo.%s", bar.Name), nil), true, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, fmt.Sprintf("bar.%s.foo", bar.Name), nil), true, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, fmt.Sprintf("baz.foo.%s", bar.Name), nil), false, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, "foo.X", nil), false, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, "bar.X.foo", nil), false, t)
+	checkBool(foo.checkStreamImportAuthorized(bar, "baz.foo.X", nil), false, t)
+
+	foo.addServiceExportWithAccountPos("a.*", []*Account{}, 2)
+	foo.addServiceExportWithAccountPos("b.*.a", []*Account{}, 2)
+	if err := foo.addServiceExportWithAccountPos("c.*.>", []*Account{}, 3); err == nil {
+		t.Fatal("expected error")
+	}
+	checkBool(foo.checkServiceImportAuthorized(bar, fmt.Sprintf("a.%s", bar.Name), nil), true, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, fmt.Sprintf("b.%s.a", bar.Name), nil), true, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, fmt.Sprintf("c.a.%s", bar.Name), nil), false, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, "a.X", nil), false, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, "b.X.a", nil), false, t)
+	checkBool(foo.checkServiceImportAuthorized(bar, "c.a.X", nil), false, t)
+
 	// Reset and test pwc and fwc
 	s, foo, bar := simpleAccountServer(t)
 	foo.AddStreamExport("foo.*.baz.>", []*Account{bar})
@@ -610,13 +886,13 @@ func TestSimpleMapping(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, _, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -642,7 +918,7 @@ func TestSimpleMapping(t *testing.T) {
 	}
 
 	// Now publish our message.
-	go cfoo.parseAndFlush([]byte("PUB foo 5\r\nhello\r\n"))
+	cfoo.parseAsync("PUB foo 5\r\nhello\r\n")
 
 	checkMsg := func(l, sid string) {
 		t.Helper()
@@ -652,7 +928,7 @@ func TestSimpleMapping(t *testing.T) {
 		}
 		matches := mraw[0]
 		if matches[SUB_INDEX] != "import.foo" {
-			t.Fatalf("Did not get correct subject: '%s'", matches[SUB_INDEX])
+			t.Fatalf("Did not get correct subject: wanted %q, got %q", "import.foo", matches[SUB_INDEX])
 		}
 		if matches[SID_INDEX] != sid {
 			t.Fatalf("Did not get correct sid: '%s'", matches[SID_INDEX])
@@ -704,13 +980,13 @@ func TestStreamImportLengthBug(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, _, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 	cbar, _, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -743,7 +1019,6 @@ func TestStreamImportLengthBug(t *testing.T) {
 	  }
 	}
 	`))
-	defer os.Remove(cf)
 	if _, err := ProcessConfigFile(cf); err == nil {
 		t.Fatalf("Expected an error with import with wildcard prefix")
 	}
@@ -763,7 +1038,7 @@ func TestShadowSubsCleanupOnClientClose(t *testing.T) {
 	}
 
 	cbar, _, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -794,13 +1069,13 @@ func TestNoPrefixWildcardMapping(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, _, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -814,14 +1089,14 @@ func TestNoPrefixWildcardMapping(t *testing.T) {
 	}
 
 	// Normal Subscription on bar client for literal "foo".
-	go cbar.parse([]byte("SUB foo 1\r\nPING\r\n"))
+	cbar.parseAsync("SUB foo 1\r\nPING\r\n")
 	_, err := crBar.ReadString('\n') // Make sure subscriptions were processed.
 	if err != nil {
 		t.Fatalf("Error for client 'bar' from server: %v", err)
 	}
 
 	// Now publish our message.
-	go cfoo.parseAndFlush([]byte("PUB foo 5\r\nhello\r\n"))
+	cfoo.parseAsync("PUB foo 5\r\nhello\r\n")
 
 	// Now check we got the message from normal subscription.
 	l, err := crBar.ReadString('\n')
@@ -847,13 +1122,13 @@ func TestPrefixWildcardMapping(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, _, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -868,14 +1143,14 @@ func TestPrefixWildcardMapping(t *testing.T) {
 	}
 
 	// Normal Subscription on bar client for wildcard.
-	go cbar.parse([]byte("SUB pub.imports.* 1\r\nPING\r\n"))
+	cbar.parseAsync("SUB pub.imports.* 1\r\nPING\r\n")
 	_, err := crBar.ReadString('\n') // Make sure subscriptions were processed.
 	if err != nil {
 		t.Fatalf("Error for client 'bar' from server: %v", err)
 	}
 
 	// Now publish our message.
-	go cfoo.parseAndFlush([]byte("PUB foo 5\r\nhello\r\n"))
+	cfoo.parseAsync("PUB foo 5\r\nhello\r\n")
 
 	// Now check we got the messages from wildcard subscription.
 	l, err := crBar.ReadString('\n')
@@ -901,13 +1176,13 @@ func TestPrefixWildcardMappingWithLiteralSub(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, _, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -921,14 +1196,14 @@ func TestPrefixWildcardMappingWithLiteralSub(t *testing.T) {
 	}
 
 	// Normal Subscription on bar client for wildcard.
-	go cbar.parse([]byte("SUB pub.imports.foo 1\r\nPING\r\n"))
+	cbar.parseAsync("SUB pub.imports.foo 1\r\nPING\r\n")
 	_, err := crBar.ReadString('\n') // Make sure subscriptions were processed.
 	if err != nil {
 		t.Fatalf("Error for client 'bar' from server: %v", err)
 	}
 
 	// Now publish our message.
-	go cfoo.parseAndFlush([]byte("PUB foo 5\r\nhello\r\n"))
+	cfoo.parseAsync("PUB foo 5\r\nhello\r\n")
 
 	// Now check we got the messages from wildcard subscription.
 	l, err := crBar.ReadString('\n')
@@ -954,13 +1229,13 @@ func TestMultipleImportsAndSingleWCSub(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, _, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -984,7 +1259,7 @@ func TestMultipleImportsAndSingleWCSub(t *testing.T) {
 	cbar.parse([]byte("SUB pub.* 1\r\n"))
 
 	// Now publish a message on 'foo' and 'bar'
-	go cfoo.parseAndFlush([]byte("PUB foo 5\r\nhello\r\nPUB bar 5\r\nworld\r\n"))
+	cfoo.parseAsync("PUB foo 5\r\nhello\r\nPUB bar 5\r\nworld\r\n")
 
 	// Now check we got the messages from the wildcard subscription.
 	l, err := crBar.ReadString('\n')
@@ -1055,7 +1330,7 @@ func TestAddServiceExport(t *testing.T) {
 		t.Fatalf("Error adding account service export to client foo: %v", err)
 	}
 	tr := fooAcc.exports.services["test.request"]
-	if tr != nil {
+	if len(tr.approved) != 0 {
 		t.Fatalf("Expected no authorized accounts, got %d", len(tr.approved))
 	}
 	if err := fooAcc.AddServiceExport("test.request", []*Account{barAcc}); err != nil {
@@ -1112,13 +1387,13 @@ func TestServiceExportWithWildcards(t *testing.T) {
 			}
 
 			cfoo, crFoo, _ := newClientForServer(s)
-			defer cfoo.nc.Close()
+			defer cfoo.close()
 
 			if err := cfoo.registerWithAccount(fooAcc); err != nil {
 				t.Fatalf("Error registering client with 'foo' account: %v", err)
 			}
 			cbar, crBar, _ := newClientForServer(s)
-			defer cbar.nc.Close()
+			defer cbar.close()
 
 			if err := cbar.registerWithAccount(barAcc); err != nil {
 				t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -1129,7 +1404,7 @@ func TestServiceExportWithWildcards(t *testing.T) {
 
 			// Now send the request. Remember we expect the request on our local ngs.update.
 			// We added the route with that "from" and will map it to "ngs.update.$bar"
-			go cbar.parseAndFlush([]byte("SUB reply 11\r\nPUB ngs.update reply 4\r\nhelp\r\n"))
+			cbar.parseAsync("SUB reply 11\r\nPUB ngs.update reply 4\r\nhelp\r\n")
 
 			// Now read the request from crFoo
 			l, err := crFoo.ReadString('\n')
@@ -1155,7 +1430,7 @@ func TestServiceExportWithWildcards(t *testing.T) {
 			checkPayload(crFoo, []byte("help\r\n"), t)
 
 			replyOp := fmt.Sprintf("PUB %s 2\r\n22\r\n", matches[REPLY_INDEX])
-			go cfoo.parseAndFlush([]byte(replyOp))
+			cfoo.parseAsync(replyOp)
 
 			// Now read the response from crBar
 			l, err = crBar.ReadString('\n')
@@ -1178,12 +1453,145 @@ func TestServiceExportWithWildcards(t *testing.T) {
 			}
 			checkPayload(crBar, []byte("22\r\n"), t)
 
-			// Make sure we have no service imports on fooAcc. An implicit one was created
-			// for the response but should be removed when the response was processed.
-			if nr := fooAcc.numServiceRoutes(); nr != 0 {
-				t.Fatalf("Expected no remaining routes on fooAcc, got %d", nr)
+			if nr := barAcc.NumPendingAllResponses(); nr != 0 {
+				t.Fatalf("Expected no responses on barAcc, got %d", nr)
 			}
 		})
+	}
+}
+
+func TestAccountAddServiceImportRace(t *testing.T) {
+	s, fooAcc, barAcc := simpleAccountServer(t)
+	defer s.Shutdown()
+
+	if err := fooAcc.AddServiceExport("foo.*", nil); err != nil {
+		t.Fatalf("Error adding account service export to client foo: %v", err)
+	}
+
+	total := 100
+	errCh := make(chan error, total)
+	for i := 0; i < 100; i++ {
+		go func(i int) {
+			err := barAcc.AddServiceImport(fooAcc, fmt.Sprintf("foo.%d", i), "")
+			errCh <- err // nil is a valid value.
+		}(i)
+	}
+
+	for i := 0; i < 100; i++ {
+		err := <-errCh
+		if err != nil {
+			t.Fatalf("Error adding account service import: %v", err)
+		}
+	}
+
+	barAcc.mu.Lock()
+	lens := len(barAcc.imports.services)
+	c := barAcc.internalClient()
+	barAcc.mu.Unlock()
+	if lens != total {
+		t.Fatalf("Expected %d imported services, got %d", total, lens)
+	}
+	c.mu.Lock()
+	lens = len(c.subs)
+	c.mu.Unlock()
+	if lens != total {
+		t.Fatalf("Expected %d subscriptions in internal client, got %d", total, lens)
+	}
+}
+
+func TestServiceImportWithWildcards(t *testing.T) {
+	s, fooAcc, barAcc := simpleAccountServer(t)
+	defer s.Shutdown()
+
+	if err := fooAcc.AddServiceExport("test.*", nil); err != nil {
+		t.Fatalf("Error adding account service export to client foo: %v", err)
+	}
+	// We can not map wildcards atm, so if we supply a to mapping and a wildcard we should fail.
+	if err := barAcc.AddServiceImport(fooAcc, "test.*", "foo"); err == nil {
+		t.Fatalf("Expected error adding account service import with wildcard and mapping, got none")
+	}
+	if err := barAcc.AddServiceImport(fooAcc, "test.>", ""); err == nil {
+		t.Fatalf("Expected error adding account service import with broader wildcard, got none")
+	}
+	// This should work.
+	if err := barAcc.AddServiceImport(fooAcc, "test.*", ""); err != nil {
+		t.Fatalf("Error adding account service import: %v", err)
+	}
+	// Make sure we can send and receive.
+	cfoo, crFoo, _ := newClientForServer(s)
+	defer cfoo.close()
+
+	if err := cfoo.registerWithAccount(fooAcc); err != nil {
+		t.Fatalf("Error registering client with 'foo' account: %v", err)
+	}
+
+	// Now setup the resonder under cfoo
+	cfoo.parse([]byte("SUB test.* 1\r\n"))
+
+	cbar, crBar, _ := newClientForServer(s)
+	defer cbar.close()
+
+	if err := cbar.registerWithAccount(barAcc); err != nil {
+		t.Fatalf("Error registering client with 'bar' account: %v", err)
+	}
+
+	// Now send the request.
+	go cbar.parse([]byte("SUB bar 11\r\nPUB test.22 bar 4\r\nhelp\r\n"))
+
+	// Now read the request from crFoo
+	l, err := crFoo.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Error reading from client 'bar': %v", err)
+	}
+
+	mraw := msgPat.FindAllStringSubmatch(l, -1)
+	if len(mraw) == 0 {
+		t.Fatalf("No message received")
+	}
+	matches := mraw[0]
+	if matches[SUB_INDEX] != "test.22" {
+		t.Fatalf("Did not get correct subject: '%s'", matches[SUB_INDEX])
+	}
+	if matches[SID_INDEX] != "1" {
+		t.Fatalf("Did not get correct sid: '%s'", matches[SID_INDEX])
+	}
+	// Make sure this looks like _INBOX
+	if !strings.HasPrefix(matches[REPLY_INDEX], "_R_.") {
+		t.Fatalf("Expected an _R_.* like reply, got '%s'", matches[REPLY_INDEX])
+	}
+	checkPayload(crFoo, []byte("help\r\n"), t)
+
+	replyOp := fmt.Sprintf("PUB %s 2\r\n22\r\n", matches[REPLY_INDEX])
+	go cfoo.parse([]byte(replyOp))
+
+	// Now read the response from crBar
+	l, err = crBar.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Error reading from client 'bar': %v", err)
+	}
+	mraw = msgPat.FindAllStringSubmatch(l, -1)
+	if len(mraw) == 0 {
+		t.Fatalf("No message received")
+	}
+	matches = mraw[0]
+	if matches[SUB_INDEX] != "bar" {
+		t.Fatalf("Did not get correct subject: '%s'", matches[SUB_INDEX])
+	}
+	if matches[SID_INDEX] != "11" {
+		t.Fatalf("Did not get correct sid: '%s'", matches[SID_INDEX])
+	}
+	if matches[REPLY_INDEX] != "" {
+		t.Fatalf("Did not get correct sid: '%s'", matches[SID_INDEX])
+	}
+	checkPayload(crBar, []byte("22\r\n"), t)
+
+	// Remove the service import with the wildcard and make sure hasWC is cleared.
+	barAcc.removeServiceImport("test.*")
+
+	barAcc.mu.Lock()
+	defer barAcc.mu.Unlock()
+	if len(barAcc.imports.services) != 0 {
+		t.Fatalf("Expected no imported services, got %d", len(barAcc.imports.services))
 	}
 }
 
@@ -1230,14 +1638,14 @@ func TestCrossAccountRequestReply(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, crFoo, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -1248,12 +1656,9 @@ func TestCrossAccountRequestReply(t *testing.T) {
 		t.Fatalf("Error adding account service export to client foo: %v", err)
 	}
 
-	// Test addServiceImport to make sure it requires accounts, and literalsubjects for both from and to subjects.
+	// Test addServiceImport to make sure it requires accounts.
 	if err := cbar.acc.AddServiceImport(nil, "foo", "test.request"); err != ErrMissingAccount {
 		t.Fatalf("Expected ErrMissingAccount but received %v.", err)
-	}
-	if err := cbar.acc.AddServiceImport(fooAcc, "*", "test.request"); err != ErrInvalidSubject {
-		t.Fatalf("Expected ErrInvalidSubject but received %v.", err)
 	}
 	if err := cbar.acc.AddServiceImport(fooAcc, "foo", "test..request."); err != ErrInvalidSubject {
 		t.Fatalf("Expected ErrInvalidSubject but received %v.", err)
@@ -1269,7 +1674,7 @@ func TestCrossAccountRequestReply(t *testing.T) {
 
 	// Now send the request. Remember we expect the request on our local foo. We added the route
 	// with that "from" and will map it to "test.request"
-	go cbar.parseAndFlush([]byte("SUB bar 11\r\nPUB foo bar 4\r\nhelp\r\n"))
+	cbar.parseAsync("SUB bar 11\r\nPUB foo bar 4\r\nhelp\r\n")
 
 	// Now read the request from crFoo
 	l, err := crFoo.ReadString('\n')
@@ -1295,7 +1700,7 @@ func TestCrossAccountRequestReply(t *testing.T) {
 	checkPayload(crFoo, []byte("help\r\n"), t)
 
 	replyOp := fmt.Sprintf("PUB %s 2\r\n22\r\n", matches[REPLY_INDEX])
-	go cfoo.parseAndFlush([]byte(replyOp))
+	cfoo.parseAsync(replyOp)
 
 	// Now read the response from crBar
 	l, err = crBar.ReadString('\n')
@@ -1318,10 +1723,8 @@ func TestCrossAccountRequestReply(t *testing.T) {
 	}
 	checkPayload(crBar, []byte("22\r\n"), t)
 
-	// Make sure we have no service imports on fooAcc. An implicit one was created
-	// for the response but should be removed when the response was processed.
-	if nr := fooAcc.numServiceRoutes(); nr != 0 {
-		t.Fatalf("Expected no remaining routes on fooAcc, got %d", nr)
+	if nr := barAcc.NumPendingAllResponses(); nr != 0 {
+		t.Fatalf("Expected no responses on barAcc, got %d", nr)
 	}
 }
 
@@ -1332,19 +1735,19 @@ func TestAccountRequestReplyTrackLatency(t *testing.T) {
 	// Run server in Go routine. We need this one running for internal sending of msgs.
 	go s.Start()
 	// Wait for accept loop(s) to be started
-	if !s.ReadyForConnections(10 * time.Second) {
-		panic("Unable to start NATS Server in Go Routine")
+	if err := s.readyForConnections(10 * time.Second); err != nil {
+		t.Fatal(err)
 	}
 
 	cfoo, crFoo, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
@@ -1356,15 +1759,6 @@ func TestAccountRequestReplyTrackLatency(t *testing.T) {
 	}
 
 	// Now let's add in tracking
-
-	// This looks ok but should fail because we have not set a system account needed for internal msgs.
-	if err := fooAcc.TrackServiceExport("track.service", "results"); err != ErrNoSysAccount {
-		t.Fatalf("Expected error enabling tracking latency without a system account")
-	}
-
-	if err := s.SetSystemAccount(globalAccountName); err != nil {
-		t.Fatalf("Error setting system account: %v", err)
-	}
 
 	// First check we get an error if service does not exist.
 	if err := fooAcc.TrackServiceExport("track.wrong", "results"); err != ErrMissingService {
@@ -1396,14 +1790,14 @@ func TestAccountRequestReplyTrackLatency(t *testing.T) {
 		t.Fatalf("Error adding account service import to client bar: %v", err)
 	}
 
-	// Now setup the resonder under cfoo and the listener for the results
+	// Now setup the responder under cfoo and the listener for the results
 	cfoo.parse([]byte("SUB track.service 1\r\nSUB results 2\r\n"))
 
 	readFooMsg := func() ([]byte, string) {
 		t.Helper()
 		l, err := crFoo.ReadString('\n')
 		if err != nil {
-			t.Fatalf("Error reading from client 'bar': %v", err)
+			t.Fatalf("Error reading from client 'foo': %v", err)
 		}
 		mraw := msgPat.FindAllStringSubmatch(l, -1)
 		if len(mraw) == 0 {
@@ -1418,7 +1812,7 @@ func TestAccountRequestReplyTrackLatency(t *testing.T) {
 
 	// Now send the request. Remember we expect the request on our local foo. We added the route
 	// with that "from" and will map it to "test.request"
-	go cbar.parseAndFlush([]byte("SUB resp 11\r\nPUB req resp 4\r\nhelp\r\n"))
+	cbar.parseAsync("SUB resp 11\r\nPUB req resp 4\r\nhelp\r\n")
 
 	// Now read the request from crFoo
 	_, reply := readFooMsg()
@@ -1429,7 +1823,7 @@ func TestAccountRequestReplyTrackLatency(t *testing.T) {
 	// We will wait a bit to check latency results
 	go func() {
 		time.Sleep(serviceTime)
-		cfoo.parseAndFlush([]byte(replyOp))
+		cfoo.parseAsync(replyOp)
 	}()
 
 	// Now read the response from crBar
@@ -1459,31 +1853,17 @@ func TestAccountRequestReplyTrackLatency(t *testing.T) {
 	}
 }
 
-func genAsyncFlushParser(c *client) (func(string), chan bool) {
-	pab := make(chan []byte, 16)
-	pas := func(cs string) { pab <- []byte(cs) }
-	quit := make(chan bool)
-	go func() {
-		for {
-			select {
-			case cs := <-pab:
-				c.parseAndFlush(cs)
-			case <-quit:
-				return
-			}
-		}
-	}()
-	return pas, quit
-}
-
 // This will test for leaks in the remote latency tracking via client.rrTracking
 func TestAccountTrackLatencyRemoteLeaks(t *testing.T) {
-	optsA, _ := ProcessConfigFile("./configs/seed.conf")
+	optsA, err := ProcessConfigFile("./configs/seed.conf")
+	require_NoError(t, err)
 	optsA.NoSigs, optsA.NoLog = true, true
+	optsA.ServerName = "A"
 	srvA := RunServer(optsA)
 	defer srvA.Shutdown()
 	optsB := nextServerOpts(optsA)
 	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", optsA.Cluster.Host, optsA.Cluster.Port))
+	optsB.ServerName = "B"
 	srvB := RunServer(optsB)
 	defer srvB.Shutdown()
 
@@ -1502,52 +1882,69 @@ func TestAccountTrackLatencyRemoteLeaks(t *testing.T) {
 		}
 	}
 
+	getClient := func(s *Server, name string) *client {
+		t.Helper()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, c := range s.clients {
+			c.mu.Lock()
+			n := c.opts.Name
+			c.mu.Unlock()
+			if n == name {
+				return c
+			}
+		}
+		t.Fatalf("Did not find client %q on server %q", name, s.info.ID)
+		return nil
+	}
+
 	// Test with a responder on second server, srvB. but they will not respond.
-	cfoo, crFoo, _ := newClientForServer(srvB)
-	defer cfoo.nc.Close()
+	cfooNC := natsConnect(t, srvB.ClientURL(), nats.Name("foo"))
+	defer cfooNC.Close()
+	cfoo := getClient(srvB, "foo")
 	fooAcc, _ := srvB.LookupAccount("$foo")
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 
 	// Set new limits
-	fooAcc.SetAutoExpireTTL(time.Millisecond)
-	fooAcc.SetMaxAutoExpireResponseMaps(5)
+	for _, srv := range srvs {
+		fooAcc, _ := srv.LookupAccount("$foo")
+		err := fooAcc.SetServiceExportResponseThreshold("track.service", 5*time.Millisecond)
+		if err != nil {
+			t.Fatalf("Error setting response threshold: %v", err)
+		}
+	}
 
-	// Now setup the resonder under cfoo and the listener for the results
+	// Now setup the responder under cfoo and the listener for the results
 	time.Sleep(50 * time.Millisecond)
 	baseSubs := int(srvA.NumSubscriptions())
-	cfoo.parse([]byte("SUB track.service 1\r\n"))
+	fooSub := natsSubSync(t, cfooNC, "track.service")
+	natsFlush(t, cfooNC)
 	// Wait for it to propagate.
 	checkExpectedSubs(t, baseSubs+1, srvA)
 
-	cbar, _, _ := newClientForServer(srvA)
-	defer cbar.nc.Close()
+	cbarNC := natsConnect(t, srvA.ClientURL(), nats.Name("bar"))
+	defer cbarNC.Close()
+	cbar := getClient(srvA, "bar")
+
 	barAcc, _ := srvA.LookupAccount("$bar")
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
 	}
 
-	parseAsync, quit := genAsyncFlushParser(cbar)
-	defer func() { quit <- true }()
-
-	readFooMsg := func() ([]byte, string) {
+	readFooMsg := func() {
 		t.Helper()
-		l, err := crFoo.ReadString('\n')
-		if err != nil {
-			t.Fatalf("Error reading from client 'bar': %v", err)
+		if _, err := fooSub.NextMsg(time.Second); err != nil {
+			t.Fatalf("Did not receive foo msg: %v", err)
 		}
-		mraw := msgPat.FindAllStringSubmatch(l, -1)
-		if len(mraw) == 0 {
-			t.Fatalf("No message received")
-		}
-		msg := mraw[0]
-		msgSize, _ := strconv.Atoi(msg[LEN_INDEX])
-		return grabPayload(crFoo, msgSize), msg[REPLY_INDEX]
 	}
 
 	// Send 2 requests
-	parseAsync("SUB resp 11\r\nPUB req resp 4\r\nhelp\r\nPUB req resp 4\r\nhelp\r\n")
+	natsSubSync(t, cbarNC, "resp")
+
+	natsPubReq(t, cbarNC, "req", "resp", []byte("help"))
+	natsPubReq(t, cbarNC, "req", "resp", []byte("help"))
 
 	readFooMsg()
 	readFooMsg()
@@ -1564,103 +1961,81 @@ func TestAccountTrackLatencyRemoteLeaks(t *testing.T) {
 
 	tracking := func() int {
 		rc.mu.Lock()
-		numTracking := len(rc.rrTracking)
+		var nt int
+		if rc.rrTracking != nil {
+			nt = len(rc.rrTracking.rmap)
+		}
 		rc.mu.Unlock()
-		return numTracking
+		return nt
 	}
 
-	numTracking := tracking()
-
-	if numTracking != 2 {
-		t.Fatalf("Expected to have 2 tracking replies, got %d", numTracking)
+	expectTracking := func(expected int) {
+		t.Helper()
+		checkFor(t, time.Second, 10*time.Millisecond, func() error {
+			if numTracking := tracking(); numTracking != expected {
+				return fmt.Errorf("Expected to have %d tracking replies, got %d", expected, numTracking)
+			}
+			return nil
+		})
 	}
 
-	// Make sure these remote tracking replies honor the current auto expire TTL.
-	time.Sleep(2 * time.Millisecond)
+	expectTracking(2)
+	// Make sure these remote tracking replies honor the current respThresh for a service export.
+	time.Sleep(10 * time.Millisecond)
+	expectTracking(0)
+	// Also make sure tracking is removed
+	rc.mu.Lock()
+	removed := rc.rrTracking == nil
+	rc.mu.Unlock()
+	if !removed {
+		t.Fatalf("Expected the rrTracking to be removed")
+	}
+
+	// Now let's test that a lower response threshold is picked up.
+	fSub := natsSubSync(t, cfooNC, "foo")
+	natsFlush(t, cfooNC)
+
+	// Wait for it to propagate.
+	checkExpectedSubs(t, baseSubs+4, srvA)
+
+	// queue up some first. We want to test changing when rrTracking exists.
+	natsPubReq(t, cbarNC, "req", "resp", []byte("help"))
+	readFooMsg()
+	expectTracking(1)
+
+	for _, s := range srvs {
+		fooAcc, _ := s.LookupAccount("$foo")
+		barAcc, _ := s.LookupAccount("$bar")
+		fooAcc.AddServiceExport("foo", nil)
+		fooAcc.TrackServiceExport("foo", "foo.results")
+		fooAcc.SetServiceExportResponseThreshold("foo", time.Millisecond)
+		barAcc.AddServiceImport(fooAcc, "foo", "foo")
+	}
+
+	natsSubSync(t, cbarNC, "reply")
+	natsPubReq(t, cbarNC, "foo", "reply", []byte("help"))
+	if _, err := fSub.NextMsg(time.Second); err != nil {
+		t.Fatalf("Did not receive foo msg: %v", err)
+	}
+	expectTracking(2)
 
 	rc.mu.Lock()
-	rc.pruneRemoteTracking()
-	numTracking = len(rc.rrTracking)
+	lrt := rc.rrTracking.lrt
 	rc.mu.Unlock()
-
-	if numTracking != 0 {
-		t.Fatalf("Expected to have no more tracking replies, got %d", numTracking)
+	if lrt != time.Millisecond {
+		t.Fatalf("Expected lrt of %v, got %v", time.Millisecond, lrt)
 	}
 
-	// Test that we trigger on max.
-	for i := 0; i < 4; i++ {
-		parseAsync("PUB req resp 4\r\nhelp\r\n")
-		readFooMsg()
-	}
+	// Now make sure we clear on close.
+	rc.closeConnection(ClientClosed)
 
-	if numTracking = tracking(); numTracking != 4 {
-		t.Fatalf("Expected to have 4 tracking replies, got %d", numTracking)
-	}
-
-	// Make sure they will be expired.
-	time.Sleep(2 * time.Millisecond)
-
-	// Should trigger here
-	parseAsync("PUB req resp 4\r\nhelp\r\n")
-	readFooMsg()
-
-	if numTracking = tracking(); numTracking != 1 {
-		t.Fatalf("Expected to have 1 tracking reply, got %d", numTracking)
-	}
-}
-
-func TestCrossAccountRequestReplyResponseMaps(t *testing.T) {
-	s, fooAcc, barAcc := simpleAccountServer(t)
-	defer s.Shutdown()
-
-	// Make sure they have the correct defaults
-	if max := barAcc.MaxAutoExpireResponseMaps(); max != DEFAULT_MAX_ACCOUNT_AE_RESPONSE_MAPS {
-		t.Fatalf("Expected %d for max default, but got %d", DEFAULT_MAX_ACCOUNT_AE_RESPONSE_MAPS, max)
-	}
-
-	if ttl := barAcc.AutoExpireTTL(); ttl != DEFAULT_TTL_AE_RESPONSE_MAP {
-		t.Fatalf("Expected %v for the ttl default, got %v", DEFAULT_TTL_AE_RESPONSE_MAP, ttl)
-	}
-
-	ttl := 500 * time.Millisecond
-	barAcc.SetMaxAutoExpireResponseMaps(5)
-	barAcc.SetAutoExpireTTL(ttl)
-	cfoo, _, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
-
-	if err := cfoo.registerWithAccount(fooAcc); err != nil {
-		t.Fatalf("Error registering client with 'foo' account: %v", err)
-	}
-
-	if err := barAcc.AddServiceExport("test.request", nil); err != nil {
-		t.Fatalf("Error adding account service export: %v", err)
-	}
-	if err := fooAcc.AddServiceImport(barAcc, "foo", "test.request"); err != nil {
-		t.Fatalf("Error adding account service import: %v", err)
-	}
-
-	for i := 0; i < 10; i++ {
-		cfoo.parseAndFlush([]byte("PUB foo bar 4\r\nhelp\r\n"))
-	}
-
-	// We should expire because of max.
-	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if nae := barAcc.numAutoExpireResponseMaps(); nae != 5 {
-			return fmt.Errorf("Number of responsemaps is %d", nae)
-		}
-		return nil
-	})
-
-	// Wait for the ttl to expire.
-	time.Sleep(2 * ttl)
-
-	// Now run prune and make sure we collect the timed-out ones.
-	barAcc.pruneAutoExpireResponseMaps()
-
-	// We should expire because ttl.
-	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if nae := barAcc.numAutoExpireResponseMaps(); nae != 0 {
-			return fmt.Errorf("Number of responsemaps is %d", nae)
+	// Actual tear down will be not inline.
+	checkFor(t, time.Second, 5*time.Millisecond, func() error {
+		rc.mu.Lock()
+		removed = rc.rrTracking == nil
+		rc.mu.Unlock()
+		if !removed {
+			return fmt.Errorf("Expected the rrTracking to be removed after client close")
 		}
 		return nil
 	})
@@ -1671,24 +2046,24 @@ func TestCrossAccountServiceResponseTypes(t *testing.T) {
 	defer s.Shutdown()
 
 	cfoo, crFoo, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
+	defer cfoo.close()
 
 	if err := cfoo.registerWithAccount(fooAcc); err != nil {
 		t.Fatalf("Error registering client with 'foo' account: %v", err)
 	}
 	cbar, crBar, _ := newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
 	}
 
 	// Add in the service export for the requests. Make it public.
-	if err := cfoo.acc.AddServiceExportWithResponse("test.request", Stream, nil); err != nil {
+	if err := fooAcc.AddServiceExportWithResponse("test.request", Streamed, nil); err != nil {
 		t.Fatalf("Error adding account service export to client foo: %v", err)
 	}
 	// Now add in the route mapping for request to be routed to the foo account.
-	if err := cbar.acc.AddServiceImport(fooAcc, "foo", "test.request"); err != nil {
+	if err := barAcc.AddServiceImport(fooAcc, "foo", "test.request"); err != nil {
 		t.Fatalf("Error adding account service import to client bar: %v", err)
 	}
 
@@ -1697,7 +2072,7 @@ func TestCrossAccountServiceResponseTypes(t *testing.T) {
 
 	// Now send the request. Remember we expect the request on our local foo. We added the route
 	// with that "from" and will map it to "test.request"
-	go cbar.parseAndFlush([]byte("SUB bar 11\r\nPUB foo bar 4\r\nhelp\r\n"))
+	cbar.parseAsync("SUB bar 11\r\nPUB foo bar 4\r\nhelp\r\n")
 
 	// Now read the request from crFoo
 	l, err := crFoo.ReadString('\n')
@@ -1716,20 +2091,25 @@ func TestCrossAccountServiceResponseTypes(t *testing.T) {
 	}
 	crFoo.ReadString('\n')
 
-	replyOp := []byte(fmt.Sprintf("PUB %s 2\r\n22\r\n", matches[REPLY_INDEX]))
+	replyOp := fmt.Sprintf("PUB %s 2\r\n22\r\n", matches[REPLY_INDEX])
 	var mReply []byte
 	for i := 0; i < 10; i++ {
 		mReply = append(mReply, replyOp...)
 	}
 
-	go cfoo.parseAndFlush(mReply)
+	cfoo.parseAsync(string(mReply))
 
-	var b [256]byte
-	n, err := crBar.Read(b[:])
-	if err != nil {
-		t.Fatalf("Error reading response: %v", err)
+	var buf []byte
+	for i := 0; i < 20; i++ {
+		b, err := crBar.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("Error reading response: %v", err)
+		}
+		buf = append(buf[:], b...)
+		if mraw = msgPat.FindAllStringSubmatch(string(buf), -1); len(mraw) == 10 {
+			break
+		}
 	}
-	mraw = msgPat.FindAllStringSubmatch(string(b[:n]), -1)
 	if len(mraw) != 10 {
 		t.Fatalf("Expected a response but got %d", len(mraw))
 	}
@@ -1738,23 +2118,22 @@ func TestCrossAccountServiceResponseTypes(t *testing.T) {
 	cbar.closeConnection(ClientClosed)
 
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if nr := fooAcc.numServiceRoutes(); nr != 0 {
-			return fmt.Errorf("Number of implicit service imports is %d", nr)
+		if nr := barAcc.NumPendingAllResponses(); nr != 0 {
+			return fmt.Errorf("Number of responses is %d", nr)
 		}
 		return nil
 	})
 
 	// Now test bogus reply subjects are handled and do not accumulate the response maps.
-
 	cbar, _, _ = newClientForServer(s)
-	defer cbar.nc.Close()
+	defer cbar.close()
 
 	if err := cbar.registerWithAccount(barAcc); err != nil {
 		t.Fatalf("Error registering client with 'bar' account: %v", err)
 	}
 
 	// Do not create any interest in the reply subject 'bar'. Just send a request.
-	go cbar.parseAndFlush([]byte("PUB foo bar 4\r\nhelp\r\n"))
+	cbar.parseAsync("PUB foo bar 4\r\nhelp\r\n")
 
 	// Now read the request from crFoo
 	l, err = crFoo.ReadString('\n')
@@ -1772,110 +2151,26 @@ func TestCrossAccountServiceResponseTypes(t *testing.T) {
 	}
 	crFoo.ReadString('\n')
 
-	replyOp = []byte(fmt.Sprintf("PUB %s 2\r\n22\r\n", matches[REPLY_INDEX]))
+	replyOp = fmt.Sprintf("PUB %s 2\r\n22\r\n", matches[REPLY_INDEX])
 
-	// Make sure we have the response map.
-	if nr := fooAcc.numServiceRoutes(); nr != 1 {
-		t.Fatalf("Expected a response map to be present, got %d", nr)
-	}
-
-	go cfoo.parseAndFlush(replyOp)
+	cfoo.parseAsync(replyOp)
 
 	// Now wait for a bit, the reply should trip a no interest condition
 	// which should clean this up.
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if nr := fooAcc.numServiceRoutes(); nr != 0 {
-			return fmt.Errorf("Number of implicit service imports is %d", nr)
+		if nr := fooAcc.NumPendingAllResponses(); nr != 0 {
+			return fmt.Errorf("Number of responses is %d", nr)
 		}
 		return nil
 	})
 
 	// Also make sure the response map entry is gone as well.
-	barAcc.mu.RLock()
-	lrm := len(barAcc.respMap)
-	barAcc.mu.RUnlock()
+	fooAcc.mu.RLock()
+	lrm := len(fooAcc.exports.responses)
+	fooAcc.mu.RUnlock()
 
 	if lrm != 0 {
-		t.Fatalf("Expected the respMap tp be cleared, got %d entries", lrm)
-	}
-}
-
-// This is for bogus reply subjects and no responses from a service provider.
-func TestCrossAccountServiceResponseLeaks(t *testing.T) {
-	s, fooAcc, barAcc := simpleAccountServer(t)
-	defer s.Shutdown()
-
-	// Set max response maps to < 100
-	barAcc.SetMaxResponseMaps(99)
-
-	cfoo, crFoo, _ := newClientForServer(s)
-	defer cfoo.nc.Close()
-
-	if err := cfoo.registerWithAccount(fooAcc); err != nil {
-		t.Fatalf("Error registering client with 'foo' account: %v", err)
-	}
-	cbar, _, _ := newClientForServer(s)
-	defer cbar.nc.Close()
-
-	if err := cbar.registerWithAccount(barAcc); err != nil {
-		t.Fatalf("Error registering client with 'bar' account: %v", err)
-	}
-
-	// Add in the service export for the requests. Make it public.
-	if err := cfoo.acc.AddServiceExportWithResponse("test.request", Stream, nil); err != nil {
-		t.Fatalf("Error adding account service export to client foo: %v", err)
-	}
-	// Now add in the route mapping for request to be routed to the foo account.
-	if err := cbar.acc.AddServiceImport(fooAcc, "foo", "test.request"); err != nil {
-		t.Fatalf("Error adding account service import to client bar: %v", err)
-	}
-
-	// Now setup the resonder under cfoo
-	cfoo.parse([]byte("SUB test.request 1\r\n"))
-
-	// Now send some requests..We will not respond.
-	var sb strings.Builder
-	for i := 0; i < 50; i++ {
-		sb.WriteString(fmt.Sprintf("PUB foo REPLY.%d 4\r\nhelp\r\n", i))
-	}
-	go cbar.parseAndFlush([]byte(sb.String()))
-
-	// Make sure requests are processed.
-	if _, err := crFoo.ReadString('\n'); err != nil {
-		t.Fatalf("Error reading from client 'bar': %v", err)
-	}
-
-	// We should have leaked response maps.
-	if nr := fooAcc.numServiceRoutes(); nr != 50 {
-		t.Fatalf("Expected response maps to be present, got %d", nr)
-	}
-
-	sb.Reset()
-	for i := 50; i < 100; i++ {
-		sb.WriteString(fmt.Sprintf("PUB foo REPLY.%d 4\r\nhelp\r\n", i))
-	}
-	go cbar.parseAndFlush([]byte(sb.String()))
-
-	// Make sure requests are processed.
-	if _, err := crFoo.ReadString('\n'); err != nil {
-		t.Fatalf("Error reading from client 'bar': %v", err)
-	}
-
-	// They should be gone here eventually.
-	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		if nr := fooAcc.numServiceRoutes(); nr != 0 {
-			return fmt.Errorf("Number of implicit service imports is %d", nr)
-		}
-		return nil
-	})
-
-	// Also make sure the response map entry is gone as well.
-	barAcc.mu.RLock()
-	lrm := len(barAcc.respMap)
-	barAcc.mu.RUnlock()
-
-	if lrm != 0 {
-		t.Fatalf("Expected the respMap tp be cleared, got %d entries", lrm)
+		t.Fatalf("Expected the responses to be cleared, got %d entries", lrm)
 	}
 }
 
@@ -1900,12 +2195,13 @@ func TestAccountMapsUsers(t *testing.T) {
       }
     }
     `))
-	defer os.Remove(confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Unexpected error parsing config file: %v", err)
 	}
+	opts.NoSigs = true
 	s := New(opts)
+	defer s.Shutdown()
 	synadia, _ := s.LookupAccount("synadia")
 	nats, _ := s.LookupAccount("nats")
 
@@ -1915,6 +2211,7 @@ func TestAccountMapsUsers(t *testing.T) {
 
 	// Make sure a normal log in maps the accounts correctly.
 	c, _, _ := newClientForServer(s)
+	defer c.close()
 	connectOp := []byte("CONNECT {\"user\":\"derek\",\"pass\":\"foo\"}\r\n")
 	c.parse(connectOp)
 	if c.acc != synadia {
@@ -1922,6 +2219,7 @@ func TestAccountMapsUsers(t *testing.T) {
 	}
 
 	c, _, _ = newClientForServer(s)
+	defer c.close()
 	connectOp = []byte("CONNECT {\"user\":\"ivan\",\"pass\":\"bar\"}\r\n")
 	c.parse(connectOp)
 	if c.acc != nats {
@@ -1933,6 +2231,7 @@ func TestAccountMapsUsers(t *testing.T) {
 	pubKey, _ := kp.PublicKey()
 
 	c, cr, l := newClientForServer(s)
+	defer c.close()
 	// Check for Nonce
 	var info nonceInfo
 	err = json.Unmarshal([]byte(l[5:]), &info)
@@ -1950,7 +2249,7 @@ func TestAccountMapsUsers(t *testing.T) {
 
 	// PING needed to flush the +OK to us.
 	cs := fmt.Sprintf("CONNECT {\"nkey\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", pubKey, sig)
-	go c.parse([]byte(cs))
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
@@ -1964,6 +2263,7 @@ func TestAccountMapsUsers(t *testing.T) {
 	pubKey, _ = kp.PublicKey()
 
 	c, cr, l = newClientForServer(s)
+	defer c.close()
 	// Check for Nonce
 	err = json.Unmarshal([]byte(l[5:]), &info)
 	if err != nil {
@@ -1980,7 +2280,7 @@ func TestAccountMapsUsers(t *testing.T) {
 
 	// PING needed to flush the +OK to us.
 	cs = fmt.Sprintf("CONNECT {\"nkey\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", pubKey, sig)
-	go c.parse([]byte(cs))
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
@@ -2004,7 +2304,6 @@ func TestAccountGlobalDefault(t *testing.T) {
 
 	// Make sure we can not define one in a config file either.
 	confFileName := createConfFile(t, []byte(`accounts { $G {} }`))
-	defer os.Remove(confFileName)
 
 	if _, err := ProcessConfigFile(confFileName); err == nil {
 		t.Fatalf("Expected an error parsing config file with reserved account")
@@ -2166,12 +2465,1221 @@ func TestAccountDuplicateServiceImportSubject(t *testing.T) {
 	}
 }
 
+func TestMultipleStreamImportsWithSameSubjectDifferentPrefix(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	fooAcc, _ := s.RegisterAccount("foo")
+	fooAcc.AddStreamExport("test", nil)
+
+	barAcc, _ := s.RegisterAccount("bar")
+	barAcc.AddStreamExport("test", nil)
+
+	importAcc, _ := s.RegisterAccount("import")
+
+	if err := importAcc.AddStreamImport(fooAcc, "test", "foo"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if err := importAcc.AddStreamImport(barAcc, "test", "bar"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Now make sure we can see messages from both.
+	cimport, crImport, _ := newClientForServer(s)
+	defer cimport.close()
+	if err := cimport.registerWithAccount(importAcc); err != nil {
+		t.Fatalf("Error registering client with 'import' account: %v", err)
+	}
+	if err := cimport.parse([]byte("SUB *.test 1\r\n")); err != nil {
+		t.Fatalf("Error for client 'import' from server: %v", err)
+	}
+
+	cfoo, _, _ := newClientForServer(s)
+	defer cfoo.close()
+	if err := cfoo.registerWithAccount(fooAcc); err != nil {
+		t.Fatalf("Error registering client with 'foo' account: %v", err)
+	}
+
+	cbar, _, _ := newClientForServer(s)
+	defer cbar.close()
+	if err := cbar.registerWithAccount(barAcc); err != nil {
+		t.Fatalf("Error registering client with 'bar' account: %v", err)
+	}
+
+	readMsg := func() {
+		t.Helper()
+		l, err := crImport.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Error reading msg header from client 'import': %v", err)
+		}
+		mraw := msgPat.FindAllStringSubmatch(l, -1)
+		if len(mraw) == 0 {
+			t.Fatalf("No message received")
+		}
+		// Consume msg body too.
+		if _, err = crImport.ReadString('\n'); err != nil {
+			t.Fatalf("Error reading msg body from client 'import': %v", err)
+		}
+	}
+
+	cbar.parseAsync("PUB test 9\r\nhello-bar\r\n")
+	readMsg()
+
+	cfoo.parseAsync("PUB test 9\r\nhello-foo\r\n")
+	readMsg()
+}
+
+// This should work with prefixes that are different but we also want it to just work with same subject
+// being imported from multiple accounts.
+func TestMultipleStreamImportsWithSameSubject(t *testing.T) {
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	fooAcc, _ := s.RegisterAccount("foo")
+	fooAcc.AddStreamExport("test", nil)
+
+	barAcc, _ := s.RegisterAccount("bar")
+	barAcc.AddStreamExport("test", nil)
+
+	importAcc, _ := s.RegisterAccount("import")
+
+	if err := importAcc.AddStreamImport(fooAcc, "test", ""); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// Since we allow this now, make sure we do detect a duplicate import from same account etc.
+	// That should be not allowed.
+	if err := importAcc.AddStreamImport(fooAcc, "test", ""); err != ErrStreamImportDuplicate {
+		t.Fatalf("Expected ErrStreamImportDuplicate but got %v", err)
+	}
+
+	if err := importAcc.AddStreamImport(barAcc, "test", ""); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Now make sure we can see messages from both.
+	cimport, crImport, _ := newClientForServer(s)
+	defer cimport.close()
+	if err := cimport.registerWithAccount(importAcc); err != nil {
+		t.Fatalf("Error registering client with 'import' account: %v", err)
+	}
+	if err := cimport.parse([]byte("SUB test 1\r\n")); err != nil {
+		t.Fatalf("Error for client 'import' from server: %v", err)
+	}
+
+	cfoo, _, _ := newClientForServer(s)
+	defer cfoo.close()
+	if err := cfoo.registerWithAccount(fooAcc); err != nil {
+		t.Fatalf("Error registering client with 'foo' account: %v", err)
+	}
+
+	cbar, _, _ := newClientForServer(s)
+	defer cbar.close()
+	if err := cbar.registerWithAccount(barAcc); err != nil {
+		t.Fatalf("Error registering client with 'bar' account: %v", err)
+	}
+
+	readMsg := func() {
+		t.Helper()
+		l, err := crImport.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Error reading msg header from client 'import': %v", err)
+		}
+		mraw := msgPat.FindAllStringSubmatch(l, -1)
+		if len(mraw) == 0 {
+			t.Fatalf("No message received")
+		}
+		// Consume msg body too.
+		if _, err = crImport.ReadString('\n'); err != nil {
+			t.Fatalf("Error reading msg body from client 'import': %v", err)
+		}
+	}
+
+	cbar.parseAsync("PUB test 9\r\nhello-bar\r\n")
+	readMsg()
+
+	cfoo.parseAsync("PUB test 9\r\nhello-foo\r\n")
+	readMsg()
+}
+
+func TestAccountBasicRouteMapping(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+	acc.AddMapping("foo", "bar")
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	checkPending(fsub, 0)
+	checkPending(bsub, 1)
+
+	acc.RemoveMapping("foo")
+
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending(fsub, 1)
+	checkPending(bsub, 1)
+}
+
+func TestAccountWildcardRouteMapping(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+
+	addMap := func(src, dest string) {
+		t.Helper()
+		if err := acc.AddMapping(src, dest); err != nil {
+			t.Fatalf("Error adding mapping: %v", err)
+		}
+	}
+
+	addMap("foo.*.*", "bar.$2.$1")
+	addMap("bar.*.>", "baz.$1.>")
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	pub := func(subj string) {
+		t.Helper()
+		err := nc.Publish(subj, nil)
+		if err == nil {
+			err = nc.Flush()
+		}
+		if err != nil {
+			t.Fatalf("Error publishing: %v", err)
+		}
+	}
+
+	fsub, _ := nc.SubscribeSync("foo.>")
+	bsub, _ := nc.SubscribeSync("bar.>")
+	zsub, _ := nc.SubscribeSync("baz.>")
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	pub("foo.1.2")
+
+	checkPending(fsub, 0)
+	checkPending(bsub, 1)
+	checkPending(zsub, 0)
+}
+
+func TestAccountRouteMappingChangesAfterClientStart(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	// Create the client first then add in mapping.
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	nc.Flush()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+	acc.AddMapping("foo", "bar")
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	checkPending(fsub, 0)
+	checkPending(bsub, 1)
+
+	acc.RemoveMapping("foo")
+
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending(fsub, 1)
+	checkPending(bsub, 1)
+}
+
+func TestAccountSimpleWeightedRouteMapping(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+	acc.AddWeightedMappings("foo", NewMapDest("bar", 50))
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+
+	total := 500
+	for i := 0; i < total; i++ {
+		nc.Publish("foo", nil)
+	}
+	nc.Flush()
+
+	fpending, _, _ := fsub.Pending()
+	bpending, _, _ := bsub.Pending()
+
+	h := total / 2
+	tp := h / 5
+	min, max := h-tp, h+tp
+	if fpending < min || fpending > max {
+		t.Fatalf("Expected about %d msgs, got %d and %d", h, fpending, bpending)
+	}
+}
+
+func TestAccountMultiWeightedRouteMappings(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+
+	// Check failures for bad weights.
+	shouldErr := func(rds ...*MapDest) {
+		t.Helper()
+		if acc.AddWeightedMappings("foo", rds...) == nil {
+			t.Fatalf("Expected an error, got none")
+		}
+	}
+	shouldNotErr := func(rds ...*MapDest) {
+		t.Helper()
+		if err := acc.AddWeightedMappings("foo", rds...); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	shouldErr(NewMapDest("bar", 150))
+	shouldNotErr(NewMapDest("bar", 50))
+	shouldNotErr(NewMapDest("bar", 50), NewMapDest("baz", 50))
+	// Same dest duplicated should error.
+	shouldErr(NewMapDest("bar", 50), NewMapDest("bar", 50))
+	// total over 100
+	shouldErr(NewMapDest("bar", 50), NewMapDest("baz", 60))
+
+	acc.RemoveMapping("foo")
+
+	// 20 for original, you can leave it off will be auto-added.
+	shouldNotErr(NewMapDest("bar", 50), NewMapDest("baz", 30))
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+	zsub, _ := nc.SubscribeSync("baz")
+
+	// For checking later.
+	rds := []struct {
+		sub *nats.Subscription
+		w   uint8
+	}{
+		{fsub, 20},
+		{bsub, 50},
+		{zsub, 30},
+	}
+
+	total := 5000
+	for i := 0; i < total; i++ {
+		nc.Publish("foo", nil)
+	}
+	nc.Flush()
+
+	for _, rd := range rds {
+		pending, _, _ := rd.sub.Pending()
+		expected := total / int(100/rd.w)
+		tp := expected / 5 // 20%
+		min, max := expected-tp, expected+tp
+		if pending < min || pending > max {
+			t.Fatalf("Expected about %d msgs for %q, got %d", expected, rd.sub.Subject, pending)
+		}
+	}
+}
+
+func TestGlobalAccountRouteMappingsConfiguration(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+	mappings = {
+		foo: bar
+		foo.*: [ { dest: bar.v1.$1, weight: 40% }, { destination: baz.v2.$1, weight: 20 } ]
+		bar.*.*: RAB.$2.$1
+    }
+    `))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	bsub, _ := nc.SubscribeSync("bar")
+	fsub1, _ := nc.SubscribeSync("bar.v1.>")
+	fsub2, _ := nc.SubscribeSync("baz.v2.>")
+	zsub, _ := nc.SubscribeSync("RAB.>")
+	f22sub, _ := nc.SubscribeSync("foo.*")
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	nc.Publish("foo", nil)
+	nc.Publish("bar.11.22", nil)
+
+	total := 500
+	for i := 0; i < total; i++ {
+		nc.Publish("foo.22", nil)
+	}
+	nc.Flush()
+
+	checkPending(bsub, 1)
+	checkPending(zsub, 1)
+
+	fpending, _, _ := f22sub.Pending()
+	fpending1, _, _ := fsub1.Pending()
+	fpending2, _, _ := fsub2.Pending()
+
+	if fpending1 < fpending2 || fpending < fpending2 {
+		t.Fatalf("Loadbalancing seems off for the foo.* mappings: %d and %d and %d", fpending, fpending1, fpending2)
+	}
+}
+
+func TestAccountRouteMappingsConfiguration(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+	accounts {
+		synadia {
+			users = [{user: derek, password: foo}]
+			mappings = {
+				foo: bar
+				foo.*: [ { dest: bar.v1.$1, weight: 40% }, { destination: baz.v2.$1, weight: 20 } ]
+				bar.*.*: RAB.$2.$1
+		    }
+		}
+	}
+    `))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	// We test functionality above, so for this one just make sure we have mappings for the account.
+	acc, _ := s.LookupAccount("synadia")
+	if !acc.hasMappings() {
+		t.Fatalf("Account %q does not have mappings", "synadia")
+	}
+
+	az, err := s.Accountz(&AccountzOptions{"synadia"})
+	if err != nil {
+		t.Fatalf("Error getting Accountz: %v", err)
+	}
+	if az.Account == nil {
+		t.Fatalf("Expected an Account")
+	}
+	if len(az.Account.Mappings) != 3 {
+		t.Fatalf("Expected %d mappings, saw %d", 3, len(az.Account.Mappings))
+	}
+}
+
+func TestAccountRouteMappingsWithLossInjection(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+	mappings = {
+		foo: { dest: foo, weight: 80% }
+		bar: { dest: bar, weight: 0% }
+    }
+    `))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	sub, _ := nc.SubscribeSync("foo")
+
+	total := 1000
+	for i := 0; i < total; i++ {
+		nc.Publish("foo", nil)
+	}
+	nc.Flush()
+
+	if pending, _, _ := sub.Pending(); pending == total {
+		t.Fatalf("Expected some loss and pending to not be same as sent")
+	}
+
+	sub, _ = nc.SubscribeSync("bar")
+	for i := 0; i < total; i++ {
+		nc.Publish("bar", nil)
+	}
+	nc.Flush()
+
+	if pending, _, _ := sub.Pending(); pending != 0 {
+		t.Fatalf("Expected all messages to be dropped and pending to be 0, got %d", pending)
+	}
+}
+
+func TestAccountRouteMappingsWithOriginClusterFilter(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+	mappings = {
+		foo: { dest: bar, cluster: SYN, weight: 100% }
+    }
+    `))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	sub, _ := nc.SubscribeSync("foo")
+
+	total := 1000
+	for i := 0; i < total; i++ {
+		nc.Publish("foo", nil)
+	}
+	nc.Flush()
+
+	if pending, _, _ := sub.Pending(); pending != total {
+		t.Fatalf("Expected pending to be %d, got %d", total, pending)
+	}
+
+	s.setClusterName("SYN")
+	sub, _ = nc.SubscribeSync("bar")
+	for i := 0; i < total; i++ {
+		nc.Publish("foo", nil)
+	}
+	nc.Flush()
+
+	if pending, _, _ := sub.Pending(); pending != total {
+		t.Fatalf("Expected pending to be %d, got %d", total, pending)
+	}
+}
+
+func TestAccountServiceImportWithRouteMappings(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+    accounts {
+      foo {
+        users = [{user: derek, password: foo}]
+        exports = [{service: "request"}]
+      }
+      bar {
+        users = [{user: ivan, password: bar}]
+        imports = [{service: {account: "foo", subject:"request"}}]
+      }
+    }
+    `))
+
+	s, opts := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount("foo")
+	acc.AddMapping("request", "request.v2")
+
+	// Create the service client first.
+	ncFoo := natsConnect(t, fmt.Sprintf("nats://derek:foo@%s:%d", opts.Host, opts.Port))
+	defer ncFoo.Close()
+
+	fooSub := natsSubSync(t, ncFoo, "request.v2")
+	ncFoo.Flush()
+
+	// Requestor
+	ncBar := natsConnect(t, fmt.Sprintf("nats://ivan:bar@%s:%d", opts.Host, opts.Port))
+	defer ncBar.Close()
+
+	ncBar.Publish("request", nil)
+	ncBar.Flush()
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if n, _, _ := fooSub.Pending(); n != 1 {
+			return fmt.Errorf("Expected a request for %q, but got %d", fooSub.Subject, n)
+		}
+		return nil
+	})
+}
+
+func TestAccountImportsWithWildcardSupport(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+    accounts {
+      foo {
+        users = [{user: derek, password: foo}]
+        exports = [
+          { service: "request.*" }
+          { stream: "events.>" }
+          { stream: "info.*.*.>" }
+        ]
+      }
+      bar {
+        users = [{user: ivan, password: bar}]
+        imports = [
+          { service: {account: "foo", subject:"request.*"}, to:"my.request.*"}
+          { stream:  {account: "foo", subject:"events.>"}, to:"foo.events.>"}
+          { stream:  {account: "foo", subject:"info.*.*.>"}, to:"foo.info.$2.$1.>"}
+        ]
+      }
+    }
+    `))
+
+	s, opts := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	ncFoo := natsConnect(t, fmt.Sprintf("nats://derek:foo@%s:%d", opts.Host, opts.Port))
+	defer ncFoo.Close()
+
+	ncBar := natsConnect(t, fmt.Sprintf("nats://ivan:bar@%s:%d", opts.Host, opts.Port))
+	defer ncBar.Close()
+
+	// Create subscriber for the service endpoint in foo.
+	_, err := ncFoo.QueueSubscribe("request.*", "t22", func(m *nats.Msg) {
+		if m.Subject != "request.22" {
+			t.Fatalf("Expected literal subject for request, got %q", m.Subject)
+		}
+		m.Respond([]byte("yes!"))
+	})
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	ncFoo.Flush()
+
+	// Now test service import.
+	resp, err := ncBar.Request("my.request.22", []byte("yes?"), time.Second)
+	if err != nil {
+		t.Fatalf("Expected a response")
+	}
+	if string(resp.Data) != "yes!" {
+		t.Fatalf("Expected a response of %q, got %q", "yes!", resp.Data)
+	}
+
+	// Now test stream imports.
+	esub, _ := ncBar.SubscribeSync("foo.events.*") // subset
+	isub, _ := ncBar.SubscribeSync("foo.info.>")
+	ncBar.Flush()
+
+	// Now publish some stream events.
+	ncFoo.Publish("events.22", nil)
+	ncFoo.Publish("info.11.22.bar", nil)
+	ncFoo.Flush()
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		checkFor(t, time.Second, 10*time.Millisecond, func() error {
+			if n, _, _ := sub.Pending(); n != expected {
+				return fmt.Errorf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+			}
+			return nil
+		})
+	}
+
+	checkPending(esub, 1)
+	checkPending(isub, 1)
+
+	// Now check to make sure the subjects are correct etc.
+	m, err := esub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if m.Subject != "foo.events.22" {
+		t.Fatalf("Incorrect subject for stream import, expected %q, got %q", "foo.events.22", m.Subject)
+	}
+
+	m, err = isub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if m.Subject != "foo.info.22.11.bar" {
+		t.Fatalf("Incorrect subject for stream import, expected %q, got %q", "foo.info.22.11.bar", m.Subject)
+	}
+}
+
+// duplicates TestJWTAccountImportsWithWildcardSupport (jwt_test.go) in config
+func TestAccountImportsWithWildcardSupportStreamAndService(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+    accounts {
+      foo {
+        users = [{user: derek, password: foo}]
+        exports = [
+          { service: "$request.*.$in.*.>" }
+          { stream: "$events.*.$in.*.>" }
+        ]
+      }
+      bar {
+        users = [{user: ivan, password: bar}]
+        imports = [
+          { service: {account: "foo", subject:"$request.*.$in.*.>"}, to:"my.request.$2.$1.>"}
+          { stream:  {account: "foo", subject:"$events.*.$in.*.>"}, to:"my.events.$2.$1.>"}
+        ]
+      }
+    }
+    `))
+
+	s, opts := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	ncFoo := natsConnect(t, fmt.Sprintf("nats://derek:foo@%s:%d", opts.Host, opts.Port))
+	defer ncFoo.Close()
+
+	ncBar := natsConnect(t, fmt.Sprintf("nats://ivan:bar@%s:%d", opts.Host, opts.Port))
+	defer ncBar.Close()
+
+	// Create subscriber for the service endpoint in foo.
+	_, err := ncFoo.Subscribe("$request.>", func(m *nats.Msg) {
+		if m.Subject != "$request.2.$in.1.bar" {
+			t.Fatalf("Expected literal subject for request, got %q", m.Subject)
+		}
+		m.Respond([]byte("yes!"))
+	})
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	ncFoo.Flush()
+
+	// Now test service import.
+	if resp, err := ncBar.Request("my.request.1.2.bar", []byte("yes?"), time.Second); err != nil {
+		t.Fatalf("Expected a response")
+	} else if string(resp.Data) != "yes!" {
+		t.Fatalf("Expected a response of %q, got %q", "yes!", resp.Data)
+	}
+	subBar, err := ncBar.SubscribeSync("my.events.>")
+	if err != nil {
+		t.Fatalf("Expected a response")
+	}
+	ncBar.Flush()
+
+	ncFoo.Publish("$events.1.$in.2.bar", nil)
+
+	m, err := subBar.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Expected a response")
+	}
+	if m.Subject != "my.events.2.1.bar" {
+		t.Fatalf("Expected literal subject for request, got %q", m.Subject)
+	}
+}
+
 func BenchmarkNewRouteReply(b *testing.B) {
 	opts := defaultServerOptions
 	s := New(&opts)
-	c, _, _ := newClientForServer(s)
+	g := s.globalAccount()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.newServiceReply(false)
+		g.newServiceReply(false)
+	}
+}
+
+func TestSamplingHeader(t *testing.T) {
+	test := func(expectSampling bool, h http.Header) {
+		t.Helper()
+		b := strings.Builder{}
+		b.WriteString("\r\n") // simulate status line
+		h.Write(&b)
+		b.WriteString("\r\n")
+		hdrString := b.String()
+		c := &client{parseState: parseState{msgBuf: []byte(hdrString), pa: pubArg{hdr: len(hdrString)}}}
+		sample, hdr := shouldSample(&serviceLatency{0, "foo"}, c)
+		if expectSampling {
+			if !sample {
+				t.Fatal("Expected to sample")
+			} else if hdr == nil {
+				t.Fatal("Expected a header")
+			}
+			for k, v := range h {
+				if hdr.Get(k) != v[0] {
+					t.Fatal("Expect header to match")
+				}
+			}
+		} else {
+			if sample {
+				t.Fatal("Expected not to sample")
+			} else if hdr != nil {
+				t.Fatal("Expected no header")
+			}
+		}
+	}
+
+	test(false, http.Header{"Uber-Trace-Id": []string{"0:0:0:0"}})
+	test(false, http.Header{"Uber-Trace-Id": []string{"0:0:0:00"}}) // one byte encoded as two hex digits
+	test(true, http.Header{"Uber-Trace-Id": []string{"0:0:0:1"}})
+	test(true, http.Header{"Uber-Trace-Id": []string{"0:0:0:01"}})
+	test(true, http.Header{"Uber-Trace-Id": []string{"0:0:0:5"}}) // debug and sample
+	test(true, http.Header{"Uber-Trace-Id": []string{"479fefe9525eddb:5adb976bfc1f95c1:479fefe9525eddb:1"}})
+	test(true, http.Header{"Uber-Trace-Id": []string{"479fefe9525eddb:479fefe9525eddb:0:1"}})
+	test(false, http.Header{"Uber-Trace-Id": []string{"479fefe9525eddb:5adb976bfc1f95c1:479fefe9525eddb:0"}})
+	test(false, http.Header{"Uber-Trace-Id": []string{"479fefe9525eddb:479fefe9525eddb:0:0"}})
+
+	test(true, http.Header{"X-B3-Sampled": []string{"1"}})
+	test(false, http.Header{"X-B3-Sampled": []string{"0"}})
+	test(true, http.Header{"X-B3-TraceId": []string{"80f198ee56343ba864fe8b2a57d3eff7"}}) // decision left to recipient
+	test(false, http.Header{"X-B3-TraceId": []string{"80f198ee56343ba864fe8b2a57d3eff7"}, "X-B3-Sampled": []string{"0"}})
+	test(true, http.Header{"X-B3-TraceId": []string{"80f198ee56343ba864fe8b2a57d3eff7"}, "X-B3-Sampled": []string{"1"}})
+
+	test(false, http.Header{"B3": []string{"0"}}) // deny only
+	test(false, http.Header{"B3": []string{"0-0-0-0"}})
+	test(false, http.Header{"B3": []string{"0-0-0"}})
+	test(true, http.Header{"B3": []string{"0-0-1-0"}})
+	test(true, http.Header{"B3": []string{"0-0-1"}})
+	test(true, http.Header{"B3": []string{"0-0-d"}}) // debug is not a deny
+	test(true, http.Header{"B3": []string{"80f198ee56343ba864fe8b2a57d3eff7-e457b5a2e4d86bd1-1"}})
+	test(true, http.Header{"B3": []string{"80f198ee56343ba864fe8b2a57d3eff7-e457b5a2e4d86bd1-1-05e3ac9a4f6e3b90"}})
+	test(false, http.Header{"B3": []string{"80f198ee56343ba864fe8b2a57d3eff7-e457b5a2e4d86bd1-0-05e3ac9a4f6e3b90"}})
+
+	test(true, http.Header{"traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}})
+	test(false, http.Header{"traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"}})
+}
+
+func TestSubjectTransforms(t *testing.T) {
+	shouldErr := func(src, dest string) {
+		t.Helper()
+		if _, err := newTransform(src, dest); err != ErrBadSubject && !errors.Is(err, ErrInvalidMappingDestination) {
+			t.Fatalf("Did not get an error for src=%q and dest=%q", src, dest)
+		}
+	}
+
+	shouldErr("foo.*.*", "bar.$2") // Must place all pwcs.
+
+	// Must be valid subjects.
+	shouldErr("foo", "")
+	shouldErr("foo..", "bar")
+
+	// Wildcards are allowed in src, but must be matched by token placements on the other side.
+	// e.g. foo.* -> bar.$1.
+	// Need to have as many pwcs as placements on other side.
+	shouldErr("foo.*", "bar.*")
+	shouldErr("foo.*", "bar.$2")                   // Bad pwc token identifier
+	shouldErr("foo.*", "bar.$1.>")                 // fwcs have to match.
+	shouldErr("foo.>", "bar.baz")                  // fwcs have to match.
+	shouldErr("foo.*.*", "bar.$2")                 // Must place all pwcs.
+	shouldErr("foo.*", "foo.$foo")                 // invalid $ value
+	shouldErr("foo.*", "foo.{{wildcard(2)}}")      // Mapping function being passed an out of range wildcard index
+	shouldErr("foo.*", "foo.{{unimplemented(1)}}") // Mapping trying to use an unknown mapping function
+	shouldErr("foo.*", "foo.{{partition(10)}}")    // Not enough arguments passed to the mapping function
+	shouldErr("foo.*", "foo.{{wildcard(foo)}}")    // Invalid argument passed to the mapping function
+	shouldErr("foo.*", "foo.{{wildcard()}}")       // Not enough arguments passed to the mapping function
+	shouldErr("foo.*", "foo.{{wildcard(1,2)}}")    // Too many arguments passed to the mapping function
+	shouldErr("foo.*", "foo.{{ wildcard5) }}")     // Bad mapping function
+	shouldErr("foo.*", "foo.{{splitLeft(2,2}}")    // arg out of range
+
+	shouldBeOK := func(src, dest string) *transform {
+		t.Helper()
+		tr, err := newTransform(src, dest)
+		if err != nil {
+			t.Fatalf("Got an error %v for src=%q and dest=%q", err, src, dest)
+		}
+		return tr
+	}
+
+	shouldBeOK("foo", "bar")
+	shouldBeOK("foo.*.bar.*.baz", "req.$2.$1")
+	shouldBeOK("baz.>", "mybaz.>")
+	shouldBeOK("*.*", "{{partition(10,1,2)}}")
+	shouldBeOK("foo.*.*", "foo.{{wildcard(1)}}.{{wildcard(2)}}.{{partition(5,1,2)}}")
+	shouldBeOK("*", "{{splitfromleft(1,1)}}")
+
+	shouldMatch := func(src, dest, sample, expected string) {
+		t.Helper()
+		tr := shouldBeOK(src, dest)
+		s, err := tr.Match(sample)
+		if err != nil {
+			t.Fatalf("Got an error %v when expecting a match for %q to %q", err, sample, expected)
+		}
+		if s != expected {
+			t.Fatalf("Dest does not match what was expected. Got %q, expected %q", s, expected)
+		}
+	}
+
+	shouldMatch("foo", "bar", "foo", "bar")
+	shouldMatch("foo.*.bar.*.baz", "req.$2.$1", "foo.A.bar.B.baz", "req.B.A")
+	shouldMatch("baz.>", "my.pre.>", "baz.1.2.3", "my.pre.1.2.3")
+	shouldMatch("baz.>", "foo.bar.>", "baz.1.2.3", "foo.bar.1.2.3")
+	shouldMatch("*", "foo.bar.$1", "foo", "foo.bar.foo")
+	shouldMatch("*", "{{splitfromleft(1,3)}}", "12345", "123.45")
+	shouldMatch("*", "{{SplitFromRight(1,3)}}", "12345", "12.345")
+	shouldMatch("*", "{{SliceFromLeft(1,3)}}", "1234567890", "123.456.789.0")
+	shouldMatch("*", "{{SliceFromRight(1,3)}}", "1234567890", "1.234.567.890")
+	shouldMatch("*", "{{split(1,-)}}", "-abc-def--ghi-", "abc.def.ghi")
+	shouldMatch("*", "{{split(1,-)}}", "abc-def--ghi-", "abc.def.ghi")
+	shouldMatch("*.*", "{{split(2,-)}}.{{splitfromleft(1,2)}}", "foo.-abc-def--ghij-", "abc.def.ghij.fo.o") // combo + checks split for multiple instance of deliminator and deliminator being at the start or end
+}
+
+func TestAccountSystemPermsWithGlobalAccess(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts {
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+	`))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Make sure we can connect with no auth to global account as normal.
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer nc.Close()
+
+	// Make sure we can connect to the system account with correct credentials.
+	sc, err := nats.Connect(s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	if err != nil {
+		t.Fatalf("Failed to create system client: %v", err)
+	}
+	defer sc.Close()
+}
+
+const importSubscriptionOverlapTemplate = `
+listen: 127.0.0.1:-1
+accounts: {
+  ACCOUNT_X: {
+	users: [
+	  {user: publisher}
+	]
+	exports: [
+	  {stream: %s}
+	]
+  },
+  ACCOUNT_Y: {
+	users: [
+	  {user: subscriber}
+	]
+	imports: [
+	  {stream: {account: ACCOUNT_X, subject: %s }, %s}
+	]
+  }
+}`
+
+func TestImportSubscriptionPartialOverlapWithPrefix(t *testing.T) {
+	cf := createConfFile(t, []byte(fmt.Sprintf(importSubscriptionOverlapTemplate, ">", ">", "prefix: myprefix")))
+
+	s, opts := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	ncX := natsConnect(t, fmt.Sprintf("nats://%s:%s@127.0.0.1:%d", "publisher", "", opts.Port))
+	defer ncX.Close()
+
+	ncY := natsConnect(t, fmt.Sprintf("nats://%s:%s@127.0.0.1:%d", "subscriber", "", opts.Port))
+	defer ncY.Close()
+
+	for _, subj := range []string{">", "myprefix.*", "myprefix.>", "myprefix.test", "*.>", "*.*", "*.test"} {
+		t.Run(subj, func(t *testing.T) {
+			sub, err := ncY.SubscribeSync(subj)
+			sub.AutoUnsubscribe(1)
+			require_NoError(t, err)
+			require_NoError(t, ncY.Flush())
+
+			ncX.Publish("test", []byte("hello"))
+
+			m, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_True(t, string(m.Data) == "hello")
+		})
+	}
+}
+
+func TestImportSubscriptionPartialOverlapWithTransform(t *testing.T) {
+	cf := createConfFile(t, []byte(fmt.Sprintf(importSubscriptionOverlapTemplate, "*.*.>", "*.*.>", "to: myprefix.$2.$1.>")))
+
+	s, opts := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	ncX := natsConnect(t, fmt.Sprintf("nats://%s:%s@127.0.0.1:%d", "publisher", "", opts.Port))
+	defer ncX.Close()
+
+	ncY := natsConnect(t, fmt.Sprintf("nats://%s:%s@127.0.0.1:%d", "subscriber", "", opts.Port))
+	defer ncY.Close()
+
+	for _, subj := range []string{">", "*.*.*.>", "*.2.*.>", "*.*.1.>", "*.2.1.>", "*.*.*.*", "*.2.1.*", "*.*.*.test",
+		"*.*.1.test", "*.2.*.test", "*.2.1.test", "myprefix.*.*.*", "myprefix.>", "myprefix.*.>", "myprefix.*.*.>",
+		"myprefix.2.>", "myprefix.2.1.>", "myprefix.*.1.>", "myprefix.2.*.>", "myprefix.2.1.*", "myprefix.*.*.test",
+		"myprefix.2.1.test"} {
+		t.Run(subj, func(t *testing.T) {
+			sub, err := ncY.SubscribeSync(subj)
+			sub.AutoUnsubscribe(1)
+			require_NoError(t, err)
+			require_NoError(t, ncY.Flush())
+
+			ncX.Publish("1.2.test", []byte("hello"))
+
+			m, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			require_True(t, string(m.Data) == "hello")
+			require_Equal(t, m.Subject, "myprefix.2.1.test")
+		})
+	}
+}
+
+func TestAccountLimitsServerConfig(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	port: -1
+	max_connections: 10
+	accounts {
+		MAXC {
+			users = [{user: derek, password: foo}]
+			limits {
+				max_connections: 5
+				max_subs: 10
+				max_payload: 32k
+				max_leafnodes: 1
+			}
+		}
+	}
+    `))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	acc, err := s.lookupAccount("MAXC")
+	require_NoError(t, err)
+
+	if mc := acc.MaxActiveConnections(); mc != 5 {
+		t.Fatalf("Did not set MaxActiveConnections properly, expected 5, got %d", mc)
+	}
+	if mlc := acc.MaxActiveLeafNodes(); mlc != 1 {
+		t.Fatalf("Did not set MaxActiveLeafNodes properly, expected 1, got %d", mlc)
+	}
+
+	// Do quick test on connections, but if they are registered above should be good.
+	for i := 0; i < 5; i++ {
+		c, err := nats.Connect(s.ClientURL(), nats.UserInfo("derek", "foo"))
+		require_NoError(t, err)
+		defer c.Close()
+	}
+
+	// Should fail.
+	_, err = nats.Connect(s.ClientURL(), nats.UserInfo("derek", "foo"))
+	require_Error(t, err)
+}
+
+func TestAccountUserSubPermsWithQueueGroups(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	listen: 127.0.0.1:-1
+
+	authorization {
+	users = [
+		{ user: user, password: "pass",
+			permissions: {
+				publish: "foo.restricted"
+				subscribe: { allow: "foo.>", deny: "foo.restricted" }
+				allow_responses: { max: 1, ttl: 0s }
+			}
+		}
+	]}
+    `))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("user", "pass"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	// qsub solo.
+	qsub, err := nc.QueueSubscribeSync("foo.>", "qg")
+	require_NoError(t, err)
+
+	err = nc.Publish("foo.restricted", []byte("RESTRICTED"))
+	require_NoError(t, err)
+	nc.Flush()
+
+	// Expect no msgs.
+	checkSubsPending(t, qsub, 0)
+}
+
+func TestAccountImportCycle(t *testing.T) {
+	tmpl := `
+	port: -1
+	accounts: {
+		CP: {
+			users: [
+				{user: cp, password: cp},
+			],
+			exports: [
+				{service: "q1.>", response_type: Singleton},
+				{service: "q2.>", response_type: Singleton},
+				%s
+			],
+		},
+		A: {
+			users: [
+				{user: a, password: a},
+			],
+			imports: [
+				{service: {account: CP, subject: "q1.>"}},
+				{service: {account: CP, subject: "q2.>"}},
+				%s
+			]
+		},
+	}
+	`
+	cf := createConfFile(t, []byte(fmt.Sprintf(tmpl, _EMPTY_, _EMPTY_)))
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+	ncCp, err := nats.Connect(s.ClientURL(), nats.UserInfo("cp", "cp"))
+	require_NoError(t, err)
+	defer ncCp.Close()
+	ncA, err := nats.Connect(s.ClientURL(), nats.UserInfo("a", "a"))
+	require_NoError(t, err)
+	defer ncA.Close()
+	// setup responder
+	natsSub(t, ncCp, "q1.>", func(m *nats.Msg) { m.Respond([]byte("reply")) })
+	// setup requestor
+	ib := "q2.inbox"
+	subAResp, err := ncA.SubscribeSync(ib)
+	require_NoError(t, err)
+	req := func() {
+		t.Helper()
+		// send request
+		err = ncA.PublishRequest("q1.a", ib, []byte("test"))
+		require_NoError(t, err)
+		mRep, err := subAResp.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_Equal(t, string(mRep.Data), "reply")
+	}
+	req()
+
+	// Update the config and do a config reload and make sure it all still work
+	changeCurrentConfigContentWithNewContent(t, cf, []byte(
+		fmt.Sprintf(tmpl, `{service: "q3.>", response_type: Singleton},`, `{service: {account: CP, subject: "q3.>"}},`)))
+	err = s.Reload()
+	require_NoError(t, err)
+	req()
+}
+
+func TestAccountImportOwnExport(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		port: -1
+		accounts: {
+			A: {
+			exports: [
+				{ service: echo, accounts: [A], latency: { subject: "latency.echo" } }
+			],
+			imports: [
+				{ service: { account: A, subject: echo } }
+			]
+
+			users: [
+				{ user: user, pass: pass }
+			]
+			}
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL(), nats.UserInfo("user", "pass"))
+	defer nc.Close()
+
+	natsSub(t, nc, "echo", func(m *nats.Msg) { m.Respond(nil) })
+	_, err := nc.Request("echo", []byte("request"), time.Second)
+	require_NoError(t, err)
+}
+
+// Test for a bug that would cause duplicate deliveries in certain situations when
+// service export/imports and leafnodes involved.
+// https://github.com/nats-io/nats-server/issues/3191
+func TestAccountImportDuplicateResponseDeliveryWithLeafnodes(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		port: -1
+		accounts: {
+			A: {
+				users = [{user: A, password: P}]
+				exports: [ { service: "foo", response_type: stream } ]
+			}
+			B: {
+				users = [{user: B, password: P}]
+				imports: [ { service: {account: "A", subject:"foo"} } ]
+			}
+		}
+		leaf { listen: "127.0.0.1:17222" }
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Requestors will connect to account B.
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("B", "P"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	// By sending a request (regardless of no responders), this will trigger a wildcard _R_ subscription since
+	// we do not have a leafnode connected.
+	nc.PublishRequest("foo", "reply", nil)
+	nc.Flush()
+
+	// Now connect the LN. This will be where the service responder lives.
+	conf = createConfFile(t, []byte(`
+		port: -1
+		leaf {
+			remotes [ { url: "nats://A:P@127.0.0.1:17222" } ]
+		}
+	`))
+	ln, _ := RunServerWithConfig(conf)
+	defer ln.Shutdown()
+	checkLeafNodeConnected(t, s)
+
+	// Now attach a responder to the LN.
+	lnc, err := nats.Connect(ln.ClientURL())
+	require_NoError(t, err)
+	defer lnc.Close()
+
+	lnc.Subscribe("foo", func(m *nats.Msg) {
+		m.Respond([]byte("bar"))
+	})
+	lnc.Flush()
+
+	// Make sure it works, but request only wants one, so need second test to show failure, but
+	// want to make sure we are wired up correctly.
+	_, err = nc.Request("foo", nil, time.Second)
+	require_NoError(t, err)
+
+	// Now setup inbox reply so we can check if we get multiple responses.
+	reply := nats.NewInbox()
+	sub, err := nc.SubscribeSync(reply)
+	require_NoError(t, err)
+
+	nc.PublishRequest("foo", reply, nil)
+
+	// Do another to make sure we know the other request will have been processed too.
+	_, err = nc.Request("foo", nil, time.Second)
+	require_NoError(t, err)
+
+	if n, _, _ := sub.Pending(); n > 1 {
+		t.Fatalf("Expected only 1 response, got %d", n)
 	}
 }

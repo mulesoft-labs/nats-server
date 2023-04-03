@@ -11,12 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows
 // +build !windows
 
 package server
 
 import (
-	"errors"
 	"testing"
 	"time"
 )
@@ -31,8 +31,8 @@ func TestRun(t *testing.T) {
 		errC <- Run(s)
 	}()
 	go func() {
-		if !s.ReadyForConnections(time.Second) {
-			started <- errors.New("failed to start in time")
+		if err := s.readyForConnections(time.Second); err != nil {
+			started <- err
 			return
 		}
 		s.Shutdown()

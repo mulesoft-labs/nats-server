@@ -11,7 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !race
+//go:build !race && !skipnoracetests
+// +build !race,!skipnoracetests
 
 package test
 

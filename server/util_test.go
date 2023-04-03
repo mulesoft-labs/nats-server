@@ -14,8 +14,10 @@
 package server
 
 import (
+	"math"
 	"math/rand"
 	"net/url"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -111,6 +113,111 @@ func TestURLsAreEqual(t *testing.T) {
 	check(t, "nats://ivan@localhost:4222", "nats://ivan@localhost:4222", true)
 	check(t, "nats://ivan:@localhost:4222", "nats://ivan:@localhost:4222", true)
 	check(t, "nats://host1:4222", "nats://host2:4222", false)
+}
+
+func TestComma(t *testing.T) {
+	type testList []struct {
+		name, got, exp string
+	}
+
+	l := testList{
+		{"0", comma(0), "0"},
+		{"10", comma(10), "10"},
+		{"100", comma(100), "100"},
+		{"1,000", comma(1000), "1,000"},
+		{"10,000", comma(10000), "10,000"},
+		{"100,000", comma(100000), "100,000"},
+		{"10,000,000", comma(10000000), "10,000,000"},
+		{"10,100,000", comma(10100000), "10,100,000"},
+		{"10,010,000", comma(10010000), "10,010,000"},
+		{"10,001,000", comma(10001000), "10,001,000"},
+		{"123,456,789", comma(123456789), "123,456,789"},
+		{"maxint", comma(9.223372e+18), "9,223,372,000,000,000,000"},
+		{"math.maxint", comma(math.MaxInt64), "9,223,372,036,854,775,807"},
+		{"math.minint", comma(math.MinInt64), "-9,223,372,036,854,775,808"},
+		{"minint", comma(-9.223372e+18), "-9,223,372,000,000,000,000"},
+		{"-123,456,789", comma(-123456789), "-123,456,789"},
+		{"-10,100,000", comma(-10100000), "-10,100,000"},
+		{"-10,010,000", comma(-10010000), "-10,010,000"},
+		{"-10,001,000", comma(-10001000), "-10,001,000"},
+		{"-10,000,000", comma(-10000000), "-10,000,000"},
+		{"-100,000", comma(-100000), "-100,000"},
+		{"-10,000", comma(-10000), "-10,000"},
+		{"-1,000", comma(-1000), "-1,000"},
+		{"-100", comma(-100), "-100"},
+		{"-10", comma(-10), "-10"},
+	}
+
+	failed := false
+	for _, test := range l {
+		if test.got != test.exp {
+			t.Errorf("On %v, expected '%v', but got '%v'",
+				test.name, test.exp, test.got)
+			failed = true
+		}
+	}
+	if failed {
+		t.FailNow()
+	}
+}
+
+func TestURLRedaction(t *testing.T) {
+	redactionFromTo := []struct {
+		Full string
+		Safe string
+	}{
+		{"nats://foo:bar@example.org", "nats://foo:xxxxx@example.org"},
+		{"nats://foo@example.org", "nats://foo@example.org"},
+		{"nats://example.org", "nats://example.org"},
+		{"nats://example.org/foo?bar=1", "nats://example.org/foo?bar=1"},
+	}
+	var err error
+	listFull := make([]*url.URL, len(redactionFromTo))
+	listSafe := make([]*url.URL, len(redactionFromTo))
+	for i := range redactionFromTo {
+		r := redactURLString(redactionFromTo[i].Full)
+		if r != redactionFromTo[i].Safe {
+			t.Fatalf("Redacting URL [index %d] %q, expected %q got %q", i, redactionFromTo[i].Full, redactionFromTo[i].Safe, r)
+		}
+		if listFull[i], err = url.Parse(redactionFromTo[i].Full); err != nil {
+			t.Fatalf("Redacting URL index %d parse Full failed: %v", i, err)
+		}
+		if listSafe[i], err = url.Parse(redactionFromTo[i].Safe); err != nil {
+			t.Fatalf("Redacting URL index %d parse Safe failed: %v", i, err)
+		}
+	}
+	results := redactURLList(listFull)
+	if !reflect.DeepEqual(results, listSafe) {
+		t.Fatalf("Redacting URL list did not compare equal, even after each URL did")
+	}
+}
+
+func TestVersionAtLeast(t *testing.T) {
+	for _, test := range []struct {
+		version string
+		major   int
+		minor   int
+		update  int
+		result  bool
+	}{
+		{"2.0.0-beta", 1, 9, 9, true},
+		{"2.0.0", 1, 99, 9, true},
+		{"2.2.0", 2, 1, 9, true},
+		{"2.2.2", 2, 2, 2, true},
+		{"2.2.2", 2, 2, 3, false},
+		{"2.2.2", 2, 3, 2, false},
+		{"2.2.2", 3, 2, 2, false},
+		{"2.22.2", 3, 0, 0, false},
+		{"2.2.22", 2, 3, 0, false},
+		{"bad.version", 1, 2, 3, false},
+	} {
+		t.Run(_EMPTY_, func(t *testing.T) {
+			if res := versionAtLeast(test.version, test.major, test.minor, test.update); res != test.result {
+				t.Fatalf("For check version %q at least %d.%d.%d result should have been %v, got %v",
+					test.version, test.major, test.minor, test.update, test.result, res)
+			}
+		})
+	}
 }
 
 func BenchmarkParseInt(b *testing.B) {

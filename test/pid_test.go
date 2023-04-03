@@ -15,7 +15,6 @@ package test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 )
@@ -23,23 +22,14 @@ import (
 func TestPidFile(t *testing.T) {
 	opts := DefaultTestOptions
 
-	tmpDir, err := ioutil.TempDir("", "_nats-server")
-	if err != nil {
-		t.Fatal("Could not create tmp dir")
-	}
-	defer os.RemoveAll(tmpDir)
-
-	file, err := ioutil.TempFile(tmpDir, "nats-server:pid_")
-	if err != nil {
-		t.Fatalf("Unable to create temp file: %v", err)
-	}
+	file := createTempFile(t, "nats-server:pid_")
 	file.Close()
 	opts.PidFile = file.Name()
 
 	s := RunServer(&opts)
 	s.Shutdown()
 
-	buf, err := ioutil.ReadFile(opts.PidFile)
+	buf, err := os.ReadFile(opts.PidFile)
 	if err != nil {
 		t.Fatalf("Could not read pid_file: %v", err)
 	}

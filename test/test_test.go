@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,14 +14,20 @@
 package test
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats-server/v2/server"
+	"golang.org/x/time/rate"
 )
 
-func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {
+func checkFor(t testing.TB, totalWait, sleepDur time.Duration, f func() error) {
 	t.Helper()
 	timeout := time.Now().Add(totalWait)
 	var err error
@@ -37,6 +43,89 @@ func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {
 	}
 }
 
+// Slow Proxy - For introducing RTT and BW constraints.
+type slowProxy struct {
+	listener net.Listener
+	conns    []net.Conn
+	o        *server.Options
+	u        string
+}
+
+func newSlowProxy(rtt time.Duration, up, down int, opts *server.Options) *slowProxy {
+	saddr := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
+	hp := net.JoinHostPort("127.0.0.1", "0")
+	l, e := net.Listen("tcp", hp)
+	if e != nil {
+		panic(fmt.Sprintf("Error listening on port: %s, %q", hp, e))
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	sp := &slowProxy{listener: l}
+	go func() {
+		client, err := l.Accept()
+		if err != nil {
+			return
+		}
+		server, err := net.DialTimeout("tcp", saddr, time.Second)
+		if err != nil {
+			panic("Can't connect to server")
+		}
+		sp.conns = append(sp.conns, client, server)
+		go sp.loop(rtt, up, client, server)
+		go sp.loop(rtt, down, server, client)
+	}()
+	sp.o = &server.Options{Host: "127.0.0.1", Port: port}
+	sp.u = fmt.Sprintf("nats://%s:%d", sp.o.Host, sp.o.Port)
+	return sp
+}
+
+func (sp *slowProxy) opts() *server.Options {
+	return sp.o
+}
+
+//lint:ignore U1000 Referenced in norace_test.go
+func (sp *slowProxy) clientURL() string {
+	return sp.u
+}
+
+func (sp *slowProxy) loop(rtt time.Duration, tbw int, r, w net.Conn) {
+	delay := rtt / 2
+	const rbl = 1024
+	var buf [rbl]byte
+	ctx := context.Background()
+
+	rl := rate.NewLimiter(rate.Limit(tbw), rbl)
+
+	for fr := true; ; {
+		sr := time.Now()
+		n, err := r.Read(buf[:])
+		if err != nil {
+			return
+		}
+		// RTT delays
+		if fr || time.Since(sr) > 2*time.Millisecond {
+			fr = false
+			time.Sleep(delay)
+		}
+		if err := rl.WaitN(ctx, n); err != nil {
+			return
+		}
+		if _, err = w.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+func (sp *slowProxy) stop() {
+	if sp.listener != nil {
+		sp.listener.Close()
+		sp.listener = nil
+		for _, c := range sp.conns {
+			c.Close()
+		}
+	}
+}
+
+// Dummy Logger
 type dummyLogger struct {
 	sync.Mutex
 	msg string

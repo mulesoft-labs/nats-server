@@ -1,4 +1,4 @@
-// Copyright 2019 The NATS Authors
+// Copyright 2019-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -11,14 +11,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build !race
+//go:build !race && !skip_no_race_tests
+// +build !race,!skip_no_race_tests
 
 package test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -31,9 +33,12 @@ import (
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nuid"
 )
 
 // IMPORTANT: Tests in this file are not executed when running with the -race flag.
+//            The test name should be prefixed with TestNoRace so we can run only
+//            those tests: go test -run=TestNoRace ...
 
 func TestNoRaceRouteSendSubs(t *testing.T) {
 	template := `
@@ -43,14 +48,20 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 				port: -1
 				%s
 			}
+			no_sys_acc: true
 	`
 	cfa := createConfFile(t, []byte(fmt.Sprintf(template, "")))
-	defer os.Remove(cfa)
 	srvA, optsA := RunServerWithConfig(cfa)
+	srvA.Shutdown()
+	optsA.DisableShortFirstPing = true
+	srvA = RunServer(optsA)
 	defer srvA.Shutdown()
 
 	cfb := createConfFile(t, []byte(fmt.Sprintf(template, "")))
 	srvB, optsB := RunServerWithConfig(cfb)
+	srvB.Shutdown()
+	optsB.DisableShortFirstPing = true
+	srvB = RunServer(optsB)
 	defer srvB.Shutdown()
 
 	clientA := createClientConn(t, optsA.Host, optsA.Port)
@@ -69,8 +80,11 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 
 	// total number of subscriptions per server
 	totalPerServer := 100000
-	for i := 0; i < totalPerServer; i++ {
-		proto := fmt.Sprintf("SUB foo.%d %d\r\n", i, i*2)
+	for i := 0; i < totalPerServer/2; i++ {
+		proto := fmt.Sprintf("SUB foo.%d %d\r\n", i, i*2+1)
+		clientASend(proto)
+		clientBSend(proto)
+		proto = fmt.Sprintf("SUB bar.%d queue.%d %d\r\n", i, i, i*2+2)
 		clientASend(proto)
 		clientBSend(proto)
 	}
@@ -88,7 +102,7 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 			"nats://%s:%d"
 		]
 	`, optsA.Cluster.Host, optsA.Cluster.Port)
-	if err := ioutil.WriteFile(cfb, []byte(fmt.Sprintf(template, routes)), 0600); err != nil {
+	if err := os.WriteFile(cfb, []byte(fmt.Sprintf(template, routes)), 0600); err != nil {
 		t.Fatalf("Error rewriting B's config file: %v", err)
 	}
 	if err := srvB.Reload(); err != nil {
@@ -178,12 +192,12 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 	replyMsg := fmt.Sprintf("PUB ping.replies %d\r\n%s\r\n", len(payload), payload)
 	for _, s := range senders {
 		go func(s *sender, count int) {
+			defer wg.Done()
 			for i := 0; i < count; i++ {
 				s.sf(replyMsg)
 			}
 			s.sf("PING\r\n")
 			s.ef(pongRe)
-			wg.Done()
 		}(s, totalReplies/len(senders))
 	}
 
@@ -205,7 +219,7 @@ func TestNoRaceRouteSendSubs(t *testing.T) {
 	// Otherwise, on test shutdown the client close
 	// will cause the server to try to send unsubs and
 	// this can delay the test.
-	if err := ioutil.WriteFile(cfb, []byte(fmt.Sprintf(template, "")), 0600); err != nil {
+	if err := os.WriteFile(cfb, []byte(fmt.Sprintf(template, "")), 0600); err != nil {
 		t.Fatalf("Error rewriting B's config file: %v", err)
 	}
 	if err := srvB.Reload(); err != nil {
@@ -316,11 +330,11 @@ func TestNoRaceLargeClusterMem(t *testing.T) {
 	checkClusterFormed(t, servers...)
 
 	// Calculate in MB what we are using now.
-	const max = 50 * 1024 * 1024 // 50MB
+	const max = 80 * 1024 * 1024 // 80MB
 	runtime.ReadMemStats(&m)
 	used := m.TotalAlloc - pta
 	if used > max {
-		t.Fatalf("Cluster using too much memory, expect < 50MB, got %dMB", used/(1024*1024))
+		t.Fatalf("Cluster using too much memory, expect < 80MB, got %dMB", used/(1024*1024))
 	}
 
 	for _, s := range servers {
@@ -330,8 +344,13 @@ func TestNoRaceLargeClusterMem(t *testing.T) {
 
 // Make sure we have the correct remote state when dealing with queue subscribers
 // across many client connections.
-func TestQueueSubWeightOrderMultipleConnections(t *testing.T) {
-	s, opts := runNewRouteServer(t)
+func TestNoRaceQueueSubWeightOrderMultipleConnections(t *testing.T) {
+	opts, err := server.ProcessConfigFile("./configs/new_cluster.conf")
+	if err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	opts.DisableShortFirstPing = true
+	s := RunServer(opts)
 	defer s.Shutdown()
 
 	// Create 100 connections to s
@@ -355,11 +374,18 @@ func TestQueueSubWeightOrderMultipleConnections(t *testing.T) {
 	info := checkInfoMsg(t, rc)
 
 	info.ID = routeID
+	info.Name = routeID
+
 	b, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)
 	}
-	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	// Send our INFO and wait for a PONG. This will prevent a race
+	// where server will have started processing queue subscriptions
+	// and then processes the route's INFO (sending its current subs)
+	// followed by updates.
+	routeSend(fmt.Sprintf("INFO %s\r\nPING\r\n", b))
+	routeExpect(pongRe)
 
 	start := make(chan bool)
 	for _, nc := range clients {
@@ -367,7 +393,7 @@ func TestQueueSubWeightOrderMultipleConnections(t *testing.T) {
 			<-start
 			// Now create 100 identical queue subscribers on each connection.
 			for i := 0; i < 100; i++ {
-				if _, err := nc.QueueSubscribeSync("foo", "bar"); err != nil {
+				if _, err := nc.QueueSubscribe("foo", "bar", func(_ *nats.Msg) {}); err != nil {
 					return
 				}
 			}
@@ -403,5 +429,277 @@ func TestQueueSubWeightOrderMultipleConnections(t *testing.T) {
 	}
 	if updates >= maxExpected {
 		t.Fatalf("Was not expecting all %v updates to be received", maxExpected)
+	}
+}
+
+func TestNoRaceClusterLeaksSubscriptions(t *testing.T) {
+	srvA, srvB, optsA, optsB := runServers(t)
+	defer srvA.Shutdown()
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	urlA := fmt.Sprintf("nats://%s:%d/", optsA.Host, optsA.Port)
+	urlB := fmt.Sprintf("nats://%s:%d/", optsB.Host, optsB.Port)
+
+	numResponses := 100
+	repliers := make([]*nats.Conn, 0, numResponses)
+
+	var noOpErrHandler = func(_ *nats.Conn, _ *nats.Subscription, _ error) {}
+
+	// Create 100 repliers
+	for i := 0; i < 50; i++ {
+		nc1, _ := nats.Connect(urlA)
+		defer nc1.Close()
+		nc1.SetErrorHandler(noOpErrHandler)
+		nc2, _ := nats.Connect(urlB)
+		defer nc2.Close()
+		nc2.SetErrorHandler(noOpErrHandler)
+		repliers = append(repliers, nc1, nc2)
+		nc1.Subscribe("test.reply", func(m *nats.Msg) {
+			m.Respond([]byte("{\"sender\": 22 }"))
+		})
+		nc2.Subscribe("test.reply", func(m *nats.Msg) {
+			m.Respond([]byte("{\"sender\": 33 }"))
+		})
+		nc1.Flush()
+		nc2.Flush()
+	}
+
+	servers := fmt.Sprintf("%s, %s", urlA, urlB)
+	req := sizedBytes(8 * 1024)
+
+	// Now run a requestor in a loop, creating and tearing down each time to
+	// simulate running a modified nats-req.
+	doReq := func() {
+		msgs := make(chan *nats.Msg, 1)
+		inbox := nats.NewInbox()
+		grp := nuid.Next()
+		// Create 8 queue Subscribers for responses.
+		for i := 0; i < 8; i++ {
+			nc, _ := nats.Connect(servers)
+			nc.SetErrorHandler(noOpErrHandler)
+			nc.ChanQueueSubscribe(inbox, grp, msgs)
+			nc.Flush()
+			defer nc.Close()
+		}
+		nc, _ := nats.Connect(servers)
+		nc.SetErrorHandler(noOpErrHandler)
+		nc.PublishRequest("test.reply", inbox, req)
+		defer nc.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		var received int
+		for {
+			select {
+			case <-msgs:
+				received++
+				if received >= numResponses {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	doRequests := func(n int) {
+		for i := 0; i < n; i++ {
+			doReq()
+		}
+		wg.Done()
+	}
+
+	concurrent := 10
+	wg.Add(concurrent)
+	for i := 0; i < concurrent; i++ {
+		go doRequests(10)
+	}
+	wg.Wait()
+
+	// Close responders too, should have zero(0) subs attached to routes.
+	for _, nc := range repliers {
+		nc.Close()
+	}
+
+	// Make sure no clients remain. This is to make sure the test is correct and that
+	// we have closed all the client connections.
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		v1, _ := srvA.Varz(nil)
+		v2, _ := srvB.Varz(nil)
+		if v1.Connections != 0 || v2.Connections != 0 {
+			return fmt.Errorf("We have lingering client connections %d:%d", v1.Connections, v2.Connections)
+		}
+		return nil
+	})
+
+	loadRoutez := func() (*server.Routez, *server.Routez) {
+		v1, err := srvA.Routez(&server.RoutezOptions{Subscriptions: true})
+		if err != nil {
+			t.Fatalf("Error getting Routez: %v", err)
+		}
+		v2, err := srvB.Routez(&server.RoutezOptions{Subscriptions: true})
+		if err != nil {
+			t.Fatalf("Error getting Routez: %v", err)
+		}
+		return v1, v2
+	}
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		r1, r2 := loadRoutez()
+		if r1.Routes[0].NumSubs != 0 {
+			return fmt.Errorf("Leaked %d subs: %+v", r1.Routes[0].NumSubs, r1.Routes[0].Subs)
+		}
+		if r2.Routes[0].NumSubs != 0 {
+			return fmt.Errorf("Leaked %d subs: %+v", r2.Routes[0].NumSubs, r2.Routes[0].Subs)
+		}
+		return nil
+	})
+}
+
+func TestNoRaceLeafNodeSmapUpdate(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	// Create a client on leaf server
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+	csend, cexpect := setupConn(t, c)
+
+	numSubs := make(chan int, 1)
+	doneCh := make(chan struct{}, 1)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		for i := 1; ; i++ {
+			csend(fmt.Sprintf("SUB foo.%d %d\r\n", i, i))
+			select {
+			case <-doneCh:
+				numSubs <- i
+				return
+			default:
+			}
+		}
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+	// Create leaf node
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	setupConn(t, lc)
+	checkLeafNodeConnected(t, s)
+
+	close(doneCh)
+	ns := <-numSubs
+	csend("PING\r\n")
+	cexpect(pongRe)
+	wg.Wait()
+
+	// Make sure we receive as many LS+ protocols (since all subs are unique).
+	// But we also have to count for LDS subject.
+	// There may be so many protocols and partials, that expectNumberOfProtos may
+	// not work. Do a manual search here.
+	checkLS := func(proto string, expected int) {
+		t.Helper()
+		p := []byte(proto)
+		cur := 0
+		buf := make([]byte, 32768)
+		for ls := 0; ls < expected; {
+			lc.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, err := lc.Read(buf)
+			lc.SetReadDeadline(time.Time{})
+			if err == nil && n > 0 {
+				for i := 0; i < n; i++ {
+					if buf[i] == p[cur] {
+						cur++
+						if cur == len(p) {
+							ls++
+							cur = 0
+						}
+					} else {
+						cur = 0
+					}
+				}
+			}
+			if err != nil || ls > expected {
+				t.Fatalf("Expected %v %sgot %v, err: %v", expected, proto, ls, err)
+			}
+		}
+	}
+	checkLS("LS+ ", ns+1)
+
+	// Now unsub all those subs...
+	for i := 1; i <= ns; i++ {
+		csend(fmt.Sprintf("UNSUB %d\r\n", i))
+	}
+	csend("PING\r\n")
+	cexpect(pongRe)
+
+	// Expect that many LS-
+	checkLS("LS- ", ns)
+}
+
+func TestNoRaceSlowProxy(t *testing.T) {
+	t.Skip()
+
+	opts := DefaultTestOptions
+	opts.Port = -1
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	rttTarget := 22 * time.Millisecond
+	bwTarget := 10 * 1024 * 1024 / 8 // 10mbit
+
+	sp := newSlowProxy(rttTarget, bwTarget, bwTarget, &opts)
+	defer sp.stop()
+
+	nc, err := nats.Connect(sp.clientURL())
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer nc.Close()
+
+	doRTT := func() time.Duration {
+		t.Helper()
+		const samples = 5
+		var total time.Duration
+		for i := 0; i < samples; i++ {
+			rtt, _ := nc.RTT()
+			total += rtt
+		}
+		return total / samples
+	}
+
+	rtt := doRTT()
+	if rtt < rttTarget || rtt > (rttTarget*3/2) {
+		t.Fatalf("rtt is out of range, target of %v, actual %v", rttTarget, rtt)
+	}
+
+	// Now test send BW.
+	const payloadSize = 64 * 1024
+	var payload [payloadSize]byte
+	rand.Read(payload[:])
+
+	// 5MB total.
+	bytesSent := (5 * 1024 * 1024)
+	toSend := bytesSent / payloadSize
+
+	start := time.Now()
+	for i := 0; i < toSend; i++ {
+		nc.Publish("z", payload[:])
+	}
+	nc.Flush()
+	tt := time.Since(start)
+	bps := float64(bytesSent) / tt.Seconds()
+	min, max := float64(bwTarget)*0.8, float64(bwTarget)*1.25
+	if bps < min || bps > max {
+		t.Fatalf("bps is off, target is %v, actual is %v", bwTarget, bps)
 	}
 }

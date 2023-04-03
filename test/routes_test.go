@@ -16,7 +16,7 @@ package test
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats-server/v2/internal/testhelper"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 )
@@ -33,6 +34,10 @@ const clientProtoInfo = 1
 
 func runRouteServer(t *testing.T) (*server.Server, *server.Options) {
 	return RunServerWithConfig("./configs/cluster.conf")
+}
+
+func runRouteServerOverrides(t *testing.T, cbo func(*server.Options), cbs func(*server.Server)) (*server.Server, *server.Options) {
+	return RunServerWithConfigOverrides("./configs/cluster.conf", cbo, cbs)
 }
 
 func TestRouterListeningSocket(t *testing.T) {
@@ -82,6 +87,7 @@ func TestSendRouteInfoOnConnect(t *testing.T) {
 	// Need to send a different INFO than the one received, otherwise the server
 	// will detect as a "cycle" and close the connection.
 	info.ID = routeID
+	info.Name = ""
 	b, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)
@@ -93,7 +99,11 @@ func TestSendRouteInfoOnConnect(t *testing.T) {
 }
 
 func TestRouteToSelf(t *testing.T) {
-	s, opts := runRouteServer(t)
+	l := testhelper.NewDummyLogger(100)
+	s, opts := runRouteServerOverrides(t, nil,
+		func(s *server.Server) {
+			s.SetLogger(l, true, true)
+		})
 	defer s.Shutdown()
 
 	rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
@@ -123,6 +133,8 @@ func TestRouteToSelf(t *testing.T) {
 	if _, err := rc.Read(buf); err == nil {
 		t.Fatal("Expected route connection to be closed")
 	}
+	// This should have been removed by removePassFromTrace(), but we also check debug logs here
+	l.CheckForProhibited(t, "route authorization password found", "top_secret")
 }
 
 func TestSendRouteSubAndUnsub(t *testing.T) {
@@ -375,7 +387,11 @@ func TestRouteQueueSemantics(t *testing.T) {
 }
 
 func TestSolicitRouteReconnect(t *testing.T) {
-	s, opts := runRouteServer(t)
+	l := testhelper.NewDummyLogger(100)
+	s, opts := runRouteServerOverrides(t, nil,
+		func(s *server.Server) {
+			s.SetLogger(l, true, true)
+		})
 	defer s.Shutdown()
 
 	rURL := opts.Routes[0]
@@ -388,6 +404,9 @@ func TestSolicitRouteReconnect(t *testing.T) {
 	// We expect to get called back..
 	route = acceptRouteConn(t, rURL.Host, 2*server.DEFAULT_ROUTE_CONNECT)
 	route.Close()
+
+	// Now we want to check for the debug logs when it tries to reconnect
+	l.CheckForProhibited(t, "route authorization password found", ":bar")
 }
 
 func TestMultipleRoutesSameId(t *testing.T) {
@@ -432,11 +451,11 @@ func TestMultipleRoutesSameId(t *testing.T) {
 	// We should only receive on one route, not both.
 	// Check both manually.
 	route1.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	buf, _ := ioutil.ReadAll(route1)
+	buf, _ := io.ReadAll(route1)
 	route1.SetReadDeadline(time.Time{})
 	if len(buf) <= 0 {
 		route2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		buf, _ = ioutil.ReadAll(route2)
+		buf, _ = io.ReadAll(route2)
 		route2.SetReadDeadline(time.Time{})
 		if len(buf) <= 0 {
 			t.Fatal("Expected to get one message on a route, received none.")
@@ -478,6 +497,7 @@ func TestRouteResendsLocalSubsOnReconnect(t *testing.T) {
 		t.Fatalf("Could not unmarshal route info: %v", err)
 	}
 	info.ID = "ROUTE:1234"
+	info.Name = ""
 	b, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)
@@ -491,6 +511,9 @@ func TestRouteResendsLocalSubsOnReconnect(t *testing.T) {
 
 	// Close and then re-open
 	route.Close()
+
+	// Give some time for the route close to be processed before trying to recreate.
+	checkNumRoutes(t, s, 0)
 
 	route = createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
 	defer route.Close()
@@ -600,6 +623,7 @@ func TestRouteSendAsyncINFOToClients(t *testing.T) {
 		sendRouteINFO := func(routeSend sendFun, routeExpect expectFun, urls []string) {
 			routeInfo := server.Info{}
 			routeInfo.ID = routeID
+			routeInfo.Cluster = "xyz"
 			routeInfo.Host = "127.0.0.1"
 			routeInfo.Port = 5222
 			routeInfo.ClientConnectURLs = urls
@@ -811,6 +835,7 @@ func TestRouteSendAsyncINFOToClients(t *testing.T) {
 	// For this test, be explicit about listen spec.
 	opts.Host = "127.0.0.1"
 	opts.Port = 5242
+	opts.DisableShortFirstPing = true
 
 	f(opts)
 	opts.Cluster.NoAdvertise = true
@@ -1074,16 +1099,12 @@ func TestRouteBasicPermissions(t *testing.T) {
 	}
 }
 
-func createConfFile(t *testing.T, content []byte) string {
+func createConfFile(t testing.TB, content []byte) string {
 	t.Helper()
-	conf, err := ioutil.TempFile("", "")
-	if err != nil {
-		t.Fatalf("Error creating conf file: %v", err)
-	}
+	conf := createTempFile(t, "")
 	fName := conf.Name()
 	conf.Close()
-	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
-		os.Remove(fName)
+	if err := os.WriteFile(fName, content, 0666); err != nil {
 		t.Fatalf("Error writing conf file: %v", err)
 	}
 	return fName
@@ -1118,6 +1139,7 @@ func TestRoutesOnlyImportOrExport(t *testing.T) {
 		cf := createConfFile(t, []byte(fmt.Sprintf(`
 			port: -1
 			cluster {
+				name: "Z"
 				port: -1
 				authorization {
 					user: ivan
@@ -1128,7 +1150,6 @@ func TestRoutesOnlyImportOrExport(t *testing.T) {
 				}
 			}
 		`, c)))
-		defer os.Remove(cf)
 		s, _ := RunServerWithConfig(cf)
 		s.Shutdown()
 	}

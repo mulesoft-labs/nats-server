@@ -15,14 +15,14 @@ package server
 
 import (
 	"bytes"
-	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
+	"time"
 
+	"github.com/nats-io/nats-server/v2/internal/testhelper"
 	"github.com/nats-io/nats-server/v2/logger"
 )
 
@@ -46,22 +46,22 @@ func TestSetLogger(t *testing.T) {
 	// Check traces
 	expectedStr := "This is a Notice"
 	server.Noticef(expectedStr)
-	dl.checkContent(t, expectedStr)
+	dl.CheckContent(t, expectedStr)
 	expectedStr = "This is an Error"
 	server.Errorf(expectedStr)
-	dl.checkContent(t, expectedStr)
+	dl.CheckContent(t, expectedStr)
 	expectedStr = "This is a Fatal"
 	server.Fatalf(expectedStr)
-	dl.checkContent(t, expectedStr)
+	dl.CheckContent(t, expectedStr)
 	expectedStr = "This is a Debug"
 	server.Debugf(expectedStr)
-	dl.checkContent(t, expectedStr)
+	dl.CheckContent(t, expectedStr)
 	expectedStr = "This is a Trace"
 	server.Tracef(expectedStr)
-	dl.checkContent(t, expectedStr)
+	dl.CheckContent(t, expectedStr)
 	expectedStr = "This is a Warning"
 	server.Tracef(expectedStr)
-	dl.checkContent(t, expectedStr)
+	dl.CheckContent(t, expectedStr)
 
 	// Make sure that we can reset to fal
 	server.SetLogger(dl, false, false)
@@ -72,56 +72,14 @@ func TestSetLogger(t *testing.T) {
 		t.Fatalf("Expected trace 0, got %v", server.logging.trace)
 	}
 	// Now, Debug and Trace should not produce anything
-	dl.msg = ""
+	dl.Msg = ""
 	server.Debugf("This Debug should not be traced")
-	dl.checkContent(t, "")
+	dl.CheckContent(t, "")
 	server.Tracef("This Trace should not be traced")
-	dl.checkContent(t, "")
+	dl.CheckContent(t, "")
 }
 
-type DummyLogger struct {
-	sync.Mutex
-	msg string
-}
-
-func (l *DummyLogger) checkContent(t *testing.T, expectedStr string) {
-	l.Lock()
-	defer l.Unlock()
-	if l.msg != expectedStr {
-		stackFatalf(t, "Expected log to be: %v, got %v", expectedStr, l.msg)
-	}
-}
-
-func (l *DummyLogger) Noticef(format string, v ...interface{}) {
-	l.Lock()
-	defer l.Unlock()
-	l.msg = fmt.Sprintf(format, v...)
-}
-func (l *DummyLogger) Errorf(format string, v ...interface{}) {
-	l.Lock()
-	defer l.Unlock()
-	l.msg = fmt.Sprintf(format, v...)
-}
-func (l *DummyLogger) Warnf(format string, v ...interface{}) {
-	l.Lock()
-	defer l.Unlock()
-	l.msg = fmt.Sprintf(format, v...)
-}
-func (l *DummyLogger) Fatalf(format string, v ...interface{}) {
-	l.Lock()
-	defer l.Unlock()
-	l.msg = fmt.Sprintf(format, v...)
-}
-func (l *DummyLogger) Debugf(format string, v ...interface{}) {
-	l.Lock()
-	defer l.Unlock()
-	l.msg = fmt.Sprintf(format, v...)
-}
-func (l *DummyLogger) Tracef(format string, v ...interface{}) {
-	l.Lock()
-	defer l.Unlock()
-	l.msg = fmt.Sprintf(format, v...)
-}
+type DummyLogger = testhelper.DummyLogger
 
 func TestReOpenLogFile(t *testing.T) {
 	// We can't rename the file log when still opened on Windows, so skip
@@ -139,19 +97,17 @@ func TestReOpenLogFile(t *testing.T) {
 	dl := &DummyLogger{}
 	s.SetLogger(dl, false, false)
 	s.ReOpenLogFile()
-	dl.checkContent(t, "File log re-open ignored, not a file logger")
+	dl.CheckContent(t, "File log re-open ignored, not a file logger")
 
 	// Set a File log
-	s.opts.LogFile = "test.log"
-	defer os.Remove(s.opts.LogFile)
-	defer os.Remove(s.opts.LogFile + ".bak")
+	s.opts.LogFile = filepath.Join(t.TempDir(), "test.log")
 	fileLog := logger.NewFileLogger(s.opts.LogFile, s.opts.Logtime, s.opts.Debug, s.opts.Trace, true)
 	s.SetLogger(fileLog, false, false)
 	// Add some log
 	expectedStr := "This is a Notice"
 	s.Noticef(expectedStr)
 	// Check content of log
-	buf, err := ioutil.ReadFile(s.opts.LogFile)
+	buf, err := os.ReadFile(s.opts.LogFile)
 	if err != nil {
 		t.Fatalf("Error reading file: %v", err)
 	}
@@ -165,7 +121,7 @@ func TestReOpenLogFile(t *testing.T) {
 	// Now re-open LogFile
 	s.ReOpenLogFile()
 	// Content should indicate that we have re-opened the log
-	buf, err = ioutil.ReadFile(s.opts.LogFile)
+	buf, err = os.ReadFile(s.opts.LogFile)
 	if err != nil {
 		t.Fatalf("Error reading file: %v", err)
 	}
@@ -174,12 +130,64 @@ func TestReOpenLogFile(t *testing.T) {
 	}
 	// Make sure we can append to the log
 	s.Noticef("New message")
-	buf, err = ioutil.ReadFile(s.opts.LogFile)
+	buf, err = os.ReadFile(s.opts.LogFile)
 	if err != nil {
 		t.Fatalf("Error reading file: %v", err)
 	}
 	if strings.HasSuffix(string(buf), "New message") {
 		t.Fatalf("New message was not appended after file was re-opened, got: %v", string(buf))
+	}
+}
+
+func TestFileLoggerSizeLimitAndReopen(t *testing.T) {
+	file := createTempFile(t, "log_")
+	file.Close()
+
+	s := &Server{opts: &Options{}}
+	defer s.SetLogger(nil, false, false)
+
+	// Set a File log
+	s.opts.LogFile = file.Name()
+	s.opts.Logtime = true
+	s.opts.LogSizeLimit = 1000
+	s.ConfigureLogger()
+
+	// Add a trace
+	s.Noticef("this is a notice")
+
+	// Do a re-open...
+	s.ReOpenLogFile()
+
+	// Content should indicate that we have re-opened the log
+	buf, err := os.ReadFile(s.opts.LogFile)
+	if err != nil {
+		t.Fatalf("Error reading file: %v", err)
+	}
+	if strings.HasSuffix(string(buf), "File log-reopened") {
+		t.Fatalf("File should indicate that file log was re-opened, got: %v", string(buf))
+	}
+
+	// Now make sure that the limit is still honored.
+	txt := make([]byte, 800)
+	for i := 0; i < len(txt); i++ {
+		txt[i] = 'A'
+	}
+	s.Noticef(string(txt))
+	for i := 0; i < len(txt); i++ {
+		txt[i] = 'B'
+	}
+	s.Noticef(string(txt))
+
+	buf, err = os.ReadFile(s.opts.LogFile)
+	if err != nil {
+		t.Fatalf("Error reading file: %v", err)
+	}
+	sbuf := string(buf)
+	if strings.Contains(sbuf, "AAAAA") || strings.Contains(sbuf, "BBBBB") {
+		t.Fatalf("Looks like file was not rotated: %s", sbuf)
+	}
+	if !strings.Contains(sbuf, "Rotated log, backup saved") {
+		t.Fatalf("File should have been rotated, was not: %s", sbuf)
 	}
 }
 
@@ -189,9 +197,10 @@ func TestNoPasswordsFromConnectTrace(t *testing.T) {
 	opts.Trace = true
 	opts.Username = "derek"
 	opts.Password = "s3cr3t"
-
+	opts.PingInterval = 2 * time.Minute
+	setBaselineOptions(opts)
 	s := &Server{opts: opts}
-	dl := &DummyLogger{}
+	dl := testhelper.NewDummyLogger(100)
 	s.SetLogger(dl, false, true)
 
 	_ = s.logging.logger.(*DummyLogger)
@@ -201,6 +210,7 @@ func TestNoPasswordsFromConnectTrace(t *testing.T) {
 	defer s.SetLogger(nil, false, false)
 
 	c, _, _ := newClientForServer(s)
+	defer c.close()
 
 	connectOp := []byte("CONNECT {\"user\":\"derek\",\"pass\":\"s3cr3t\"}\r\n")
 	err := c.parse(connectOp)
@@ -208,13 +218,7 @@ func TestNoPasswordsFromConnectTrace(t *testing.T) {
 		t.Fatalf("Received error: %v\n", err)
 	}
 
-	dl.Lock()
-	hasPass := strings.Contains(dl.msg, "s3cr3t")
-	dl.Unlock()
-
-	if hasPass {
-		t.Fatalf("Password detected in log output: %s", dl.msg)
-	}
+	dl.CheckForProhibited(t, "password found", "s3cr3t")
 }
 
 func TestRemovePassFromTrace(t *testing.T) {

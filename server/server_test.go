@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,14 +14,20 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/url"
 	"os"
+	"reflect"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,17 +37,22 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {
-	t.Helper()
+func checkForErr(totalWait, sleepDur time.Duration, f func() error) error {
 	timeout := time.Now().Add(totalWait)
 	var err error
 	for time.Now().Before(timeout) {
 		err = f()
 		if err == nil {
-			return
+			return nil
 		}
 		time.Sleep(sleepDur)
 	}
+	return err
+}
+
+func checkFor(t testing.TB, totalWait, sleepDur time.Duration, f func() error) {
+	t.Helper()
+	err := checkForErr(totalWait, sleepDur, f)
 	if err != nil {
 		t.Fatal(err.Error())
 	}
@@ -52,7 +63,7 @@ func DefaultOptions() *Options {
 		Host:     "127.0.0.1",
 		Port:     -1,
 		HTTPPort: -1,
-		Cluster:  ClusterOpts{Port: -1},
+		Cluster:  ClusterOpts{Port: -1, Name: "abc"},
 		NoLog:    true,
 		NoSigs:   true,
 		Debug:    true,
@@ -78,8 +89,8 @@ func RunServer(opts *Options) *Server {
 	go s.Start()
 
 	// Wait for accept loop(s) to be started
-	if !s.ReadyForConnections(10 * time.Second) {
-		panic("Unable to start NATS Server in Go Routine")
+	if err := s.readyForConnections(10 * time.Second); err != nil {
+		panic(err)
 	}
 	return s
 }
@@ -90,7 +101,7 @@ func LoadConfig(configFile string) (opts *Options) {
 	if err != nil {
 		panic(fmt.Sprintf("Error processing configuration file: %v", err))
 	}
-	opts.NoSigs, opts.NoLog = true, true
+	opts.NoSigs, opts.NoLog = true, opts.LogFile == _EMPTY_
 	return
 }
 
@@ -103,7 +114,8 @@ func RunServerWithConfig(configFile string) (srv *Server, opts *Options) {
 
 func TestVersionMatchesTag(t *testing.T) {
 	tag := os.Getenv("TRAVIS_TAG")
-	if tag == "" {
+	// Travis started to return '' when no tag is set. Support both now.
+	if tag == "" || tag == "''" {
 		t.SkipNow()
 	}
 	// We expect a tag of the form vX.Y.Z. If that's not the case,
@@ -127,8 +139,8 @@ func TestStartProfiler(t *testing.T) {
 }
 
 func TestStartupAndShutdown(t *testing.T) {
-
 	opts := DefaultOptions()
+	opts.NoSystemAccount = true
 
 	s := RunServer(opts)
 	defer s.Shutdown()
@@ -156,6 +168,26 @@ func TestStartupAndShutdown(t *testing.T) {
 	numSubscriptions := s.NumSubscriptions()
 	if numSubscriptions != 0 {
 		t.Fatalf("Expected numSubscriptions to be 0 vs %d\n", numSubscriptions)
+	}
+}
+
+func TestTLSVersions(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		value    uint16
+		expected string
+	}{
+		{"1.0", tls.VersionTLS10, "1.0"},
+		{"1.1", tls.VersionTLS11, "1.1"},
+		{"1.2", tls.VersionTLS12, "1.2"},
+		{"1.3", tls.VersionTLS13, "1.3"},
+		{"unknown", 0x999, "Unknown [0x999]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if v := tlsVersion(test.value); v != test.expected {
+				t.Fatalf("Expected value 0x%x to be %q, got %q", test.value, test.expected, v)
+			}
+		})
 	}
 }
 
@@ -205,8 +237,17 @@ func TestTlsCipher(t *testing.T) {
 	if strings.Compare(tlsCipher(0xc02c), "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384") != 0 {
 		t.Fatalf("Invalid tls cipher")
 	}
-	if !strings.Contains(tlsCipher(0x9999), "Unknown") {
-		t.Fatalf("Expected an unknown cipher.")
+	if strings.Compare(tlsCipher(0x1301), "TLS_AES_128_GCM_SHA256") != 0 {
+		t.Fatalf("Invalid tls cipher")
+	}
+	if strings.Compare(tlsCipher(0x1302), "TLS_AES_256_GCM_SHA384") != 0 {
+		t.Fatalf("Invalid tls cipher")
+	}
+	if strings.Compare(tlsCipher(0x1303), "TLS_CHACHA20_POLY1305_SHA256") != 0 {
+		t.Fatalf("Invalid tls cipher")
+	}
+	if strings.Compare(tlsCipher(0x9999), "Unknown [0x9999]") != 0 {
+		t.Fatalf("Expected an unknown cipher")
 	}
 }
 
@@ -359,23 +400,56 @@ func TestClientAdvertiseConnectURL(t *testing.T) {
 	s.Shutdown()
 }
 
+func TestClientAdvertiseInCluster(t *testing.T) {
+	optsA := DefaultOptions()
+	optsA.ClientAdvertise = "srvA:4222"
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	nc := natsConnect(t, srvA.ClientURL())
+	defer nc.Close()
+
+	optsB := DefaultOptions()
+	optsB.ClientAdvertise = "srvBC:4222"
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", optsA.Cluster.Port))
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	checkURLs := func(expected string) {
+		t.Helper()
+		checkFor(t, time.Second, 15*time.Millisecond, func() error {
+			srvs := nc.DiscoveredServers()
+			for _, u := range srvs {
+				if u == expected {
+					return nil
+				}
+			}
+			return fmt.Errorf("Url %q not found in %q", expected, srvs)
+		})
+	}
+	checkURLs("nats://srvBC:4222")
+
+	optsC := DefaultOptions()
+	optsC.ClientAdvertise = "srvBC:4222"
+	optsC.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", optsA.Cluster.Port))
+	srvC := RunServer(optsC)
+	defer srvC.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB, srvC)
+	checkURLs("nats://srvBC:4222")
+
+	srvB.Shutdown()
+	checkNumRoutes(t, srvA, 1)
+	checkURLs("nats://srvBC:4222")
+}
+
 func TestClientAdvertiseErrorOnStartup(t *testing.T) {
 	opts := DefaultOptions()
 	// Set invalid address
 	opts.ClientAdvertise = "addr:::123"
-	s := New(opts)
-	defer s.Shutdown()
-	dl := &DummyLogger{}
-	s.SetLogger(dl, false, false)
-
-	// Expect this to return due to failure
-	s.Start()
-	dl.Lock()
-	msg := dl.msg
-	dl.Unlock()
-	if !strings.Contains(msg, "ClientAdvertise") {
-		t.Fatalf("Unexpected error: %v", msg)
-	}
+	testFatalErrorOnStart(t, opts, "ClientAdvertise")
 }
 
 func TestNoDeadlockOnStartFailure(t *testing.T) {
@@ -390,7 +464,16 @@ func TestNoDeadlockOnStartFailure(t *testing.T) {
 
 	// This should return since it should fail to start a listener
 	// on x.x.x.x:4222
-	s.Start()
+	ch := make(chan struct{})
+	go func() {
+		s.Start()
+		close(ch)
+	}()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("Start() should have returned due to failure to start listener")
+	}
 
 	// We should be able to shutdown
 	s.Shutdown()
@@ -490,55 +573,6 @@ func TestProcessCommandLineArgs(t *testing.T) {
 	}
 }
 
-func TestWriteDeadline(t *testing.T) {
-	opts := DefaultOptions()
-	opts.WriteDeadline = 30 * time.Millisecond
-	s := RunServer(opts)
-	defer s.Shutdown()
-
-	c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port), 3*time.Second)
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer c.Close()
-	if _, err := c.Write([]byte("CONNECT {}\r\nPING\r\nSUB foo 1\r\n")); err != nil {
-		t.Fatalf("Error sending protocols to server: %v", err)
-	}
-	// Reduce socket buffer to increase reliability of getting
-	// write deadline errors.
-	c.(*net.TCPConn).SetReadBuffer(4)
-
-	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
-	sender, err := nats.Connect(url)
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer sender.Close()
-
-	payload := make([]byte, 1000000)
-	for i := 0; i < 10; i++ {
-		if err := sender.Publish("foo", payload); err != nil {
-			t.Fatalf("Error on publish: %v", err)
-		}
-	}
-	// Flush sender connection to ensure that all data has been sent.
-	if err := sender.Flush(); err != nil {
-		t.Fatalf("Error on flush: %v", err)
-	}
-
-	// At this point server should have closed connection c.
-
-	// On certain platforms, it may take more than one call before
-	// getting the error.
-	for i := 0; i < 100; i++ {
-		if _, err := c.Write([]byte("PUB bar 5\r\nhello\r\n")); err != nil {
-			// ok
-			return
-		}
-	}
-	t.Fatal("Connection should have been closed")
-}
-
 func TestRandomPorts(t *testing.T) {
 	opts := DefaultOptions()
 	opts.HTTPPort = -1
@@ -574,32 +608,46 @@ func TestNilMonitoringPort(t *testing.T) {
 	}
 }
 
-type DummyAuth struct{}
+type DummyAuth struct {
+	t         *testing.T
+	needNonce bool
+}
 
 func (d *DummyAuth) Check(c ClientAuthentication) bool {
+	if d.needNonce && len(c.GetNonce()) == 0 {
+		d.t.Fatalf("Expected a nonce but received none")
+	} else if !d.needNonce && len(c.GetNonce()) > 0 {
+		d.t.Fatalf("Received a nonce when none was expected")
+	}
+
 	return c.GetOpts().Username == "valid"
 }
 
 func TestCustomClientAuthentication(t *testing.T) {
-	var clientAuth DummyAuth
+	testAuth := func(t *testing.T, nonce bool) {
+		clientAuth := &DummyAuth{t, nonce}
 
-	opts := DefaultOptions()
-	opts.CustomClientAuthentication = &clientAuth
+		opts := DefaultOptions()
+		opts.CustomClientAuthentication = clientAuth
+		opts.AlwaysEnableNonce = nonce
 
-	s := RunServer(opts)
+		s := RunServer(opts)
+		defer s.Shutdown()
 
-	defer s.Shutdown()
+		addr := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 
-	addr := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
-
-	nc, err := nats.Connect(addr, nats.UserInfo("valid", ""))
-	if err != nil {
-		t.Fatalf("Expected client to connect, got: %s", err)
+		nc, err := nats.Connect(addr, nats.UserInfo("valid", ""))
+		if err != nil {
+			t.Fatalf("Expected client to connect, got: %s", err)
+		}
+		nc.Close()
+		if _, err := nats.Connect(addr, nats.UserInfo("invalid", "")); err == nil {
+			t.Fatal("Expected client to fail to connect")
+		}
 	}
-	nc.Close()
-	if _, err := nats.Connect(addr, nats.UserInfo("invalid", "")); err == nil {
-		t.Fatal("Expected client to fail to connect")
-	}
+
+	t.Run("with nonce", func(t *testing.T) { testAuth(t, true) })
+	t.Run("without nonce", func(t *testing.T) { testAuth(t, false) })
 }
 
 func TestCustomRouterAuthentication(t *testing.T) {
@@ -678,11 +726,30 @@ func TestProfilingNoTimeout(t *testing.T) {
 	}
 }
 
-func TestLameDuckMode(t *testing.T) {
-	atomic.StoreInt64(&lameDuckModeInitialDelay, 0)
-	defer atomic.StoreInt64(&lameDuckModeInitialDelay, lameDuckModeDefaultInitialDelay)
+func TestLameDuckOptionsValidation(t *testing.T) {
+	o := DefaultOptions()
+	o.LameDuckDuration = 5 * time.Second
+	o.LameDuckGracePeriod = 10 * time.Second
+	s, err := NewServer(o)
+	if s != nil {
+		s.Shutdown()
+	}
+	if err == nil || !strings.Contains(err.Error(), "should be strictly lower") {
+		t.Fatalf("Expected error saying that ldm grace period should be lower than ldm duration, got %v", err)
+	}
+}
 
+func testSetLDMGracePeriod(o *Options, val time.Duration) {
+	// For tests, we set the grace period as a negative value
+	// so we can have a grace period bigger than the total duration.
+	// When validating options, we would not be able to run the
+	// server without this trick.
+	o.LameDuckGracePeriod = val * -1
+}
+
+func TestLameDuckMode(t *testing.T) {
 	optsA := DefaultOptions()
+	testSetLDMGracePeriod(optsA, time.Nanosecond)
 	optsA.Cluster.Host = "127.0.0.1"
 	srvA := RunServer(optsA)
 	defer srvA.Shutdown()
@@ -747,6 +814,16 @@ func TestLameDuckMode(t *testing.T) {
 	checkClientsCount(t, srvB, total)
 
 	// Check closed status on server A
+	// Connections are saved in go routines, so although we have evaluated the number
+	// of connections in the server A to be 0, the polling of connection closed may
+	// need a bit more time.
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		cz := pollConz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
+		if n := len(cz.Conns); n != total {
+			return fmt.Errorf("expected %v closed connections, got %v", total, n)
+		}
+		return nil
+	})
 	cz := pollConz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
 	if n := len(cz.Conns); n != total {
 		t.Fatalf("Expected %v closed connections, got %v", total, n)
@@ -794,7 +871,7 @@ func TestLameDuckMode(t *testing.T) {
 	checkClientsCount(t, srvA, 0)
 	checkClientsCount(t, srvB, total)
 
-	if elapsed > optsA.LameDuckDuration {
+	if elapsed > time.Duration(float64(optsA.LameDuckDuration)*1.1) {
 		t.Fatalf("Expected to not take more than %v, got %v", optsA.LameDuckDuration, elapsed)
 	}
 
@@ -833,19 +910,21 @@ func TestLameDuckMode(t *testing.T) {
 	// Now test that we introduce delay before starting closing client connections.
 	// This allow to "signal" multiple servers and avoid their clients to reconnect
 	// to a server that is going to be going in LD mode.
-	atomic.StoreInt64(&lameDuckModeInitialDelay, int64(100*time.Millisecond))
-
+	testSetLDMGracePeriod(optsA, 100*time.Millisecond)
 	optsA.LameDuckDuration = 10 * time.Millisecond
 	srvA = RunServer(optsA)
 	defer srvA.Shutdown()
 
 	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	testSetLDMGracePeriod(optsB, 100*time.Millisecond)
 	optsB.LameDuckDuration = 10 * time.Millisecond
 	srvB = RunServer(optsB)
 	defer srvB.Shutdown()
 
 	optsC := DefaultOptions()
 	optsC.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	testSetLDMGracePeriod(optsC, 100*time.Millisecond)
+	optsC.LameDuckGracePeriod = -100 * time.Millisecond
 	optsC.LameDuckDuration = 10 * time.Millisecond
 	srvC := RunServer(optsC)
 	defer srvC.Shutdown()
@@ -878,6 +957,181 @@ func TestLameDuckMode(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestLameDuckModeInfo(t *testing.T) {
+	optsA := testWSOptions()
+	optsA.Cluster.Name = "abc"
+	optsA.Cluster.Host = "127.0.0.1"
+	optsA.Cluster.Port = -1
+	// Ensure that initial delay is set very high so that we can
+	// check that some events occur as expected before the client
+	// is disconnected.
+	testSetLDMGracePeriod(optsA, 5*time.Second)
+	optsA.LameDuckDuration = 50 * time.Millisecond
+	optsA.DisableShortFirstPing = true
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	curla := fmt.Sprintf("127.0.0.1:%d", optsA.Port)
+	wscurla := fmt.Sprintf("127.0.0.1:%d", optsA.Websocket.Port)
+	c, err := net.Dial("tcp", curla)
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	defer c.Close()
+	client := bufio.NewReaderSize(c, maxBufSize)
+
+	wsconn, wsclient := testWSCreateClient(t, false, false, optsA.Websocket.Host, optsA.Websocket.Port)
+	defer wsconn.Close()
+
+	getInfo := func(ws bool) *serverInfo {
+		t.Helper()
+		var l string
+		var err error
+		if ws {
+			l = string(testWSReadFrame(t, wsclient))
+		} else {
+			l, err = client.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Error receiving info from server: %v\n", err)
+			}
+		}
+		var info serverInfo
+		if err = json.Unmarshal([]byte(l[5:]), &info); err != nil {
+			t.Fatalf("Could not parse INFO json: %v\n", err)
+		}
+		return &info
+	}
+
+	getInfo(false)
+	c.Write([]byte("CONNECT {\"protocol\":1,\"verbose\":false}\r\nPING\r\n"))
+	client.ReadString('\n')
+
+	optsB := testWSOptions()
+	optsB.Cluster.Name = "abc"
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	checkConnectURLs := func(expected [][]string) *serverInfo {
+		t.Helper()
+		var si *serverInfo
+		for i, ws := range []bool{false, true} {
+			sort.Strings(expected[i])
+			si = getInfo(ws)
+			sort.Strings(si.ConnectURLs)
+			if !reflect.DeepEqual(expected[i], si.ConnectURLs) {
+				t.Fatalf("Expected %q, got %q", expected, si.ConnectURLs)
+			}
+		}
+		return si
+	}
+
+	curlb := fmt.Sprintf("127.0.0.1:%d", optsB.Port)
+	wscurlb := fmt.Sprintf("127.0.0.1:%d", optsB.Websocket.Port)
+	expected := [][]string{{curla, curlb}, {wscurla, wscurlb}}
+	checkConnectURLs(expected)
+
+	optsC := testWSOptions()
+	testSetLDMGracePeriod(optsA, 5*time.Second)
+	optsC.Cluster.Name = "abc"
+	optsC.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvC := RunServer(optsC)
+	defer srvC.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB, srvC)
+
+	curlc := fmt.Sprintf("127.0.0.1:%d", optsC.Port)
+	wscurlc := fmt.Sprintf("127.0.0.1:%d", optsC.Websocket.Port)
+	expected = [][]string{{curla, curlb, curlc}, {wscurla, wscurlb, wscurlc}}
+	checkConnectURLs(expected)
+
+	optsD := testWSOptions()
+	optsD.Cluster.Name = "abc"
+	optsD.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvD := RunServer(optsD)
+	defer srvD.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB, srvC, srvD)
+
+	curld := fmt.Sprintf("127.0.0.1:%d", optsD.Port)
+	wscurld := fmt.Sprintf("127.0.0.1:%d", optsD.Websocket.Port)
+	expected = [][]string{{curla, curlb, curlc, curld}, {wscurla, wscurlb, wscurlc, wscurld}}
+	checkConnectURLs(expected)
+
+	// Now lame duck server A and C. We should have client connected to A
+	// receive info that A is in LDM without A's URL, but also receive
+	// an update with C's URL gone.
+	// But first we need to create a client to C because otherwise the
+	// LDM signal will just shut it down because it would have no client.
+	nc, err := nats.Connect(srvC.ClientURL())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer nc.Close()
+	nc.Flush()
+
+	start := time.Now()
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		srvA.lameDuckMode()
+	}()
+
+	expected = [][]string{{curlb, curlc, curld}, {wscurlb, wscurlc, wscurld}}
+	si := checkConnectURLs(expected)
+	if !si.LameDuckMode {
+		t.Fatal("Expected LameDuckMode to be true, it was not")
+	}
+
+	// Start LDM for server C. This should send an update to A
+	// which in turn should remove C from the list of URLs and
+	// update its client.
+	go func() {
+		defer wg.Done()
+		srvC.lameDuckMode()
+	}()
+
+	expected = [][]string{{curlb, curld}, {wscurlb, wscurld}}
+	si = checkConnectURLs(expected)
+	// This update should not say that it is LDM.
+	if si.LameDuckMode {
+		t.Fatal("Expected LameDuckMode to be false, it was true")
+	}
+
+	// Now shutdown D, and we also should get an update.
+	srvD.Shutdown()
+
+	expected = [][]string{{curlb}, {wscurlb}}
+	si = checkConnectURLs(expected)
+	// This update should not say that it is LDM.
+	if si.LameDuckMode {
+		t.Fatal("Expected LameDuckMode to be false, it was true")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("Did not get the expected events prior of server A and C shutting down")
+	}
+
+	// Now explicitly shutdown srvA. When a server shutdown, it closes all its
+	// connections. For routes, it means that it is going to remove the remote's
+	// URL from its map. We want to make sure that in that case, server does not
+	// actually send an updated INFO to its clients.
+	srvA.Shutdown()
+
+	// Expect nothing to be received on the client connection.
+	if l, err := client.ReadString('\n'); err == nil {
+		t.Fatalf("Expected connection to fail, instead got %q", l)
+	}
+
+	c.Close()
+	nc.Close()
+	// Don't need to wait for actual disconnect of clients.
+	srvC.Shutdown()
+	wg.Wait()
 }
 
 func TestServerValidateGatewaysOptions(t *testing.T) {
@@ -987,6 +1241,87 @@ func TestAcceptError(t *testing.T) {
 	if dur := time.Since(start); dur >= ACCEPT_MAX_SLEEP {
 		t.Fatalf("Shutdown took too long: %v", dur)
 	}
+	wg.Wait()
+	if d := s.acceptError("Test", ne, orgDelay); d >= 0 {
+		t.Fatalf("Expected delay to be negative, got %v", d)
+	}
+}
+
+func TestServerShutdownDuringStart(t *testing.T) {
+	o := DefaultOptions()
+	o.ServerName = "server"
+	o.DisableShortFirstPing = true
+	o.Accounts = []*Account{NewAccount("$SYS")}
+	o.SystemAccount = "$SYS"
+	o.Cluster.Name = "abc"
+	o.Cluster.Host = "127.0.0.1"
+	o.Cluster.Port = -1
+	o.Gateway.Name = "abc"
+	o.Gateway.Host = "127.0.0.1"
+	o.Gateway.Port = -1
+	o.LeafNode.Host = "127.0.0.1"
+	o.LeafNode.Port = -1
+	o.Websocket.Host = "127.0.0.1"
+	o.Websocket.Port = -1
+	o.Websocket.HandshakeTimeout = 1
+	o.Websocket.NoTLS = true
+	o.MQTT.Host = "127.0.0.1"
+	o.MQTT.Port = -1
+
+	// We are going to test that if the server is shutdown
+	// while Start() runs (in this case, before), we don't
+	// start the listeners and therefore leave accept loops
+	// hanging.
+	s, err := NewServer(o)
+	if err != nil {
+		t.Fatalf("Error creating server: %v", err)
+	}
+	s.Shutdown()
+
+	// Start() should not block, but just in case, start in
+	// different go routine.
+	ch := make(chan struct{}, 1)
+	go func() {
+		s.Start()
+		close(ch)
+	}()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("Start appear to have blocked after server was shutdown")
+	}
+	// Now make sure that none of the listeners have been created
+	listeners := []string{}
+	s.mu.Lock()
+	if s.listener != nil {
+		listeners = append(listeners, "client")
+	}
+	if s.routeListener != nil {
+		listeners = append(listeners, "route")
+	}
+	if s.gatewayListener != nil {
+		listeners = append(listeners, "gateway")
+	}
+	if s.leafNodeListener != nil {
+		listeners = append(listeners, "leafnode")
+	}
+	if s.websocket.listener != nil {
+		listeners = append(listeners, "websocket")
+	}
+	if s.mqtt.listener != nil {
+		listeners = append(listeners, "mqtt")
+	}
+	s.mu.Unlock()
+	if len(listeners) > 0 {
+		lst := ""
+		for i, l := range listeners {
+			if i > 0 {
+				lst += ", "
+			}
+			lst += l
+		}
+		t.Fatalf("Following listeners have been created: %s", lst)
+	}
 }
 
 type myDummyDNSResolver struct {
@@ -1005,15 +1340,15 @@ func TestGetRandomIP(t *testing.T) {
 	s := &Server{}
 	resolver := &myDummyDNSResolver{}
 	// no port...
-	if _, err := s.getRandomIP(resolver, "noport"); err == nil || !strings.Contains(err.Error(), "port") {
+	if _, err := s.getRandomIP(resolver, "noport", nil); err == nil || !strings.Contains(err.Error(), "port") {
 		t.Fatalf("Expected error about port missing, got %v", err)
 	}
 	resolver.err = fmt.Errorf("on purpose")
-	if _, err := s.getRandomIP(resolver, "localhost:4222"); err == nil || !strings.Contains(err.Error(), "on purpose") {
+	if _, err := s.getRandomIP(resolver, "localhost:4222", nil); err == nil || !strings.Contains(err.Error(), "on purpose") {
 		t.Fatalf("Expected error about no port, got %v", err)
 	}
 	resolver.err = nil
-	a, err := s.getRandomIP(resolver, "localhost:4222")
+	a, err := s.getRandomIP(resolver, "localhost:4222", nil)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1021,7 +1356,7 @@ func TestGetRandomIP(t *testing.T) {
 		t.Fatalf("Expected address to be %q, got %q", "localhost:4222", a)
 	}
 	resolver.ips = []string{"1.2.3.4"}
-	a, err = s.getRandomIP(resolver, "localhost:4222")
+	a, err = s.getRandomIP(resolver, "localhost:4222", nil)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1032,7 +1367,7 @@ func TestGetRandomIP(t *testing.T) {
 	resolver.ips = []string{"1.2.3.4", "2.2.3.4", "3.2.3.4"}
 	dist := [3]int{}
 	for i := 0; i < 100; i++ {
-		ip, err := s.getRandomIP(resolver, "localhost:4222")
+		ip, err := s.getRandomIP(resolver, "localhost:4222", nil)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -1048,19 +1383,62 @@ func TestGetRandomIP(t *testing.T) {
 			t.Logf("Warning: out of expected range [%v,%v] for ip %v, got %v", low, high, i, d)
 		}
 	}
+
+	// Check IP exclusions
+	excludedIPs := map[string]struct{}{"1.2.3.4:4222": {}}
+	for i := 0; i < 100; i++ {
+		ip, err := s.getRandomIP(resolver, "localhost:4222", excludedIPs)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if ip[0] == '1' {
+			t.Fatalf("Should not have returned this ip: %q", ip)
+		}
+	}
+	excludedIPs["2.2.3.4:4222"] = struct{}{}
+	for i := 0; i < 100; i++ {
+		ip, err := s.getRandomIP(resolver, "localhost:4222", excludedIPs)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if ip[0] != '3' {
+			t.Fatalf("Should only have returned '3.2.3.4', got returned %q", ip)
+		}
+	}
+	excludedIPs["3.2.3.4:4222"] = struct{}{}
+	for i := 0; i < 100; i++ {
+		if _, err := s.getRandomIP(resolver, "localhost:4222", excludedIPs); err != errNoIPAvail {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	// Now check that exclusion takes into account the port number.
+	resolver.ips = []string{"127.0.0.1"}
+	excludedIPs = map[string]struct{}{"127.0.0.1:4222": {}}
+	for i := 0; i < 100; i++ {
+		if _, err := s.getRandomIP(resolver, "localhost:4223", excludedIPs); err == errNoIPAvail {
+			t.Fatal("Should not have failed")
+		}
+	}
 }
 
-type slowWriteConn struct {
+type shortWriteConn struct {
 	net.Conn
 }
 
-func (swc *slowWriteConn) Write(b []byte) (int, error) {
+func (swc *shortWriteConn) Write(b []byte) (int, error) {
 	// Limit the write to 10 bytes at a time.
+	short := false
 	max := len(b)
 	if max > 10 {
 		max = 10
+		short = true
 	}
-	return swc.Conn.Write(b[:max])
+	n, err := swc.Conn.Write(b[:max])
+	if err == nil && short {
+		return n, io.ErrShortWrite
+	}
+	return n, err
 }
 
 func TestClientWriteLoopStall(t *testing.T) {
@@ -1086,6 +1464,7 @@ func TestClientWriteLoopStall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on subscribe: %v", err)
 	}
+	nc.Flush()
 	cid, _ := nc.GetClientID()
 
 	sender, err := nats.Connect(url)
@@ -1096,7 +1475,7 @@ func TestClientWriteLoopStall(t *testing.T) {
 
 	c := s.getClient(cid)
 	c.mu.Lock()
-	c.nc = &slowWriteConn{Conn: c.nc}
+	c.nc = &shortWriteConn{Conn: c.nc}
 	c.mu.Unlock()
 
 	sender.Publish("foo", make([]byte, 100))
@@ -1128,6 +1507,9 @@ func TestInsecureSkipVerifyWarning(t *testing.T) {
 			s.Start()
 			wg.Done()
 		}()
+		if err := s.readyForConnections(time.Second); err != nil {
+			t.Fatal(err)
+		}
 		select {
 		case w := <-l.warn:
 			if !strings.Contains(w, expectedWarn) {
@@ -1151,6 +1533,7 @@ func TestInsecureSkipVerifyWarning(t *testing.T) {
 	}
 
 	o := DefaultOptions()
+	o.Cluster.Name = "A"
 	o.Cluster.Port = -1
 	o.Cluster.TLSConfig = config.Clone()
 	checkWarnReported(t, o, clusterTLSInsecureWarning)
@@ -1205,6 +1588,12 @@ func TestInsecureSkipVerifyWarning(t *testing.T) {
 }
 
 func TestConnectErrorReports(t *testing.T) {
+	// On Windows, an attempt to connect to a port that has no listener will
+	// take whatever timeout specified in DialTimeout() before failing.
+	// So skip for now.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
 	// Check that default report attempts is as expected
 	opts := DefaultOptions()
 	s := RunServer(opts)
@@ -1214,13 +1603,9 @@ func TestConnectErrorReports(t *testing.T) {
 		t.Fatalf("Expected default value to be %v, got %v", DEFAULT_CONNECT_ERROR_REPORTS, ra)
 	}
 
-	tmpFile, err := ioutil.TempFile("", "")
-	if err != nil {
-		t.Fatalf("Error creating temp file: %v", err)
-	}
+	tmpFile := createTempFile(t, "")
 	log := tmpFile.Name()
 	tmpFile.Close()
-	defer os.Remove(log)
 
 	remoteURLs := RoutesFromStr("nats://127.0.0.1:1234")
 
@@ -1235,23 +1620,21 @@ func TestConnectErrorReports(t *testing.T) {
 	s = RunServer(opts)
 	defer s.Shutdown()
 
-	// Wait long enough for the number of recurring attempts to happen
-	time.Sleep(10 * routeConnectDelay)
-	s.Shutdown()
-
-	content, err := ioutil.ReadFile(log)
-	if err != nil {
-		t.Fatalf("Error reading log file: %v", err)
-	}
-
 	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
 		t.Helper()
-		present := bytes.Contains(content, []byte(fmt.Sprintf("%s (attempt %d)", txt, attempt)))
-		if shouldBeThere && !present {
-			t.Fatalf("Did not find expected log statement (%s) for attempt %d: %s", txt, attempt, content)
-		} else if !shouldBeThere && present {
-			t.Fatalf("Log statement (%s) for attempt %d should not be present: %s", txt, attempt, content)
-		}
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			content, err := os.ReadFile(log)
+			if err != nil {
+				return fmt.Errorf("Error reading log file: %v", err)
+			}
+			present := bytes.Contains(content, []byte(fmt.Sprintf("%s (attempt %d)", txt, attempt)))
+			if shouldBeThere && !present {
+				return fmt.Errorf("Did not find expected log statement (%s) for attempt %d: %s", txt, attempt, content)
+			} else if !shouldBeThere && present {
+				return fmt.Errorf("Log statement (%s) for attempt %d should not be present: %s", txt, attempt, content)
+			}
+			return nil
+		})
 	}
 
 	type testConnect struct {
@@ -1274,33 +1657,32 @@ func TestConnectErrorReports(t *testing.T) {
 		})
 	}
 
-	os.Remove(log)
+	s.Shutdown()
+	removeFile(t, log)
 
 	// Now try with leaf nodes
 	opts.Cluster.Port = 0
 	opts.Routes = nil
-	opts.LeafNode.Remotes = []*RemoteLeafOpts{&RemoteLeafOpts{URLs: []*url.URL{remoteURLs[0]}}}
+	opts.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{remoteURLs[0]}}}
 	opts.LeafNode.ReconnectInterval = 15 * time.Millisecond
 	s = RunServer(opts)
 	defer s.Shutdown()
 
-	// Wait long enough for the number of recurring attempts to happen
-	time.Sleep(10 * opts.LeafNode.ReconnectInterval)
-	s.Shutdown()
-
-	content, err = ioutil.ReadFile(log)
-	if err != nil {
-		t.Fatalf("Error reading log file: %v", err)
-	}
-
 	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
 		t.Helper()
-		present := bytes.Contains(content, []byte(fmt.Sprintf("%s %q (attempt %d)", txt, host, attempt)))
-		if shouldBeThere && !present {
-			t.Fatalf("Did not find expected log statement (%s %q) for attempt %d: %s", txt, host, attempt, content)
-		} else if !shouldBeThere && present {
-			t.Fatalf("Log statement (%s %q) for attempt %d should not be present: %s", txt, host, attempt, content)
-		}
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			content, err := os.ReadFile(log)
+			if err != nil {
+				return fmt.Errorf("Error reading log file: %v", err)
+			}
+			present := bytes.Contains(content, []byte(fmt.Sprintf("%s %q (attempt %d)", txt, host, attempt)))
+			if shouldBeThere && !present {
+				return fmt.Errorf("Did not find expected log statement (%s %q) for attempt %d: %s", txt, host, attempt, content)
+			} else if !shouldBeThere && present {
+				return fmt.Errorf("Log statement (%s %q) for attempt %d should not be present: %s", txt, host, attempt, content)
+			}
+			return nil
+		})
 	}
 
 	for _, test := range []testConnect{
@@ -1318,14 +1700,16 @@ func TestConnectErrorReports(t *testing.T) {
 		})
 	}
 
-	os.Remove(log)
+	s.Shutdown()
+	removeFile(t, log)
 
 	// Now try with gateways
 	opts.LeafNode.Remotes = nil
+	opts.Cluster.Name = "A"
 	opts.Gateway.Name = "A"
 	opts.Gateway.Port = -1
 	opts.Gateway.Gateways = []*RemoteGatewayOpts{
-		&RemoteGatewayOpts{
+		{
 			Name: "B",
 			URLs: remoteURLs,
 		},
@@ -1333,15 +1717,6 @@ func TestConnectErrorReports(t *testing.T) {
 	opts.gatewaysSolicitDelay = 15 * time.Millisecond
 	s = RunServer(opts)
 	defer s.Shutdown()
-
-	// Wait long enough for the number of recurring attempts to happen
-	time.Sleep(10 * gatewayConnectDelay)
-	s.Shutdown()
-
-	content, err = ioutil.ReadFile(log)
-	if err != nil {
-		t.Fatalf("Error reading log file: %v", err)
-	}
 
 	for _, test := range []testConnect{
 		{"gateway_attempt_1", 1, true},
@@ -1364,6 +1739,12 @@ func TestConnectErrorReports(t *testing.T) {
 }
 
 func TestReconnectErrorReports(t *testing.T) {
+	// On Windows, an attempt to connect to a port that has no listener will
+	// take whatever timeout specified in DialTimeout() before failing.
+	// So skip for now.
+	if runtime.GOOS == "windows" {
+		t.Skip()
+	}
 	// Check that default report attempts is as expected
 	opts := DefaultOptions()
 	s := RunServer(opts)
@@ -1373,13 +1754,9 @@ func TestReconnectErrorReports(t *testing.T) {
 		t.Fatalf("Expected default value to be %v, got %v", DEFAULT_RECONNECT_ERROR_REPORTS, ra)
 	}
 
-	tmpFile, err := ioutil.TempFile("", "")
-	if err != nil {
-		t.Fatalf("Error creating temp file: %v", err)
-	}
+	tmpFile := createTempFile(t, "")
 	log := tmpFile.Name()
 	tmpFile.Close()
-	defer os.Remove(log)
 
 	csOpts := DefaultOptions()
 	csOpts.Cluster.Port = -1
@@ -1403,23 +1780,24 @@ func TestReconnectErrorReports(t *testing.T) {
 	// Now shutdown the server s connected to.
 	cs.Shutdown()
 
-	// Wait long enough for the number of recurring attempts to happen
-	time.Sleep(DEFAULT_ROUTE_RECONNECT + 15*routeConnectDelay)
-	s.Shutdown()
-
-	content, err := ioutil.ReadFile(log)
-	if err != nil {
-		t.Fatalf("Error reading log file: %v", err)
-	}
+	// Specifically for route test, wait at least reconnect interval before checking logs
+	time.Sleep(DEFAULT_ROUTE_RECONNECT)
 
 	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
 		t.Helper()
-		present := bytes.Contains(content, []byte(fmt.Sprintf("%s (attempt %d)", txt, attempt)))
-		if shouldBeThere && !present {
-			t.Fatalf("Did not find expected log statement (%s) for attempt %d: %s", txt, attempt, content)
-		} else if !shouldBeThere && present {
-			t.Fatalf("Log statement (%s) for attempt %d should not be present: %s", txt, attempt, content)
-		}
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			content, err := os.ReadFile(log)
+			if err != nil {
+				return fmt.Errorf("Error reading log file: %v", err)
+			}
+			present := bytes.Contains(content, []byte(fmt.Sprintf("%s (attempt %d)", txt, attempt)))
+			if shouldBeThere && !present {
+				return fmt.Errorf("Did not find expected log statement (%s) for attempt %d: %s", txt, attempt, content)
+			} else if !shouldBeThere && present {
+				return fmt.Errorf("Log statement (%s) for attempt %d should not be present: %s", txt, attempt, content)
+			}
+			return nil
+		})
 	}
 
 	type testConnect struct {
@@ -1442,10 +1820,12 @@ func TestReconnectErrorReports(t *testing.T) {
 		})
 	}
 
-	os.Remove(log)
+	s.Shutdown()
+	removeFile(t, log)
 
 	// Now try with leaf nodes
 	csOpts.Cluster.Port = 0
+	csOpts.Cluster.Name = _EMPTY_
 	csOpts.LeafNode.Host = "127.0.0.1"
 	csOpts.LeafNode.Port = -1
 
@@ -1453,40 +1833,34 @@ func TestReconnectErrorReports(t *testing.T) {
 	defer cs.Shutdown()
 
 	opts.Cluster.Port = 0
+	opts.Cluster.Name = _EMPTY_
 	opts.Routes = nil
 	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", csOpts.LeafNode.Port))
-	opts.LeafNode.Remotes = []*RemoteLeafOpts{&RemoteLeafOpts{URLs: []*url.URL{u}}}
+	opts.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
 	opts.LeafNode.ReconnectInterval = 15 * time.Millisecond
 	s = RunServer(opts)
 	defer s.Shutdown()
 
-	checkFor(t, 3*time.Second, 10*time.Millisecond, func() error {
-		if nln := s.NumLeafNodes(); nln != 1 {
-			return fmt.Errorf("Number of leaf nodes is %d", nln)
-		}
-		return nil
-	})
+	checkLeafNodeConnected(t, s)
 
 	// Now shutdown the server s is connected to
 	cs.Shutdown()
 
-	// Wait long enough for the number of recurring attempts to happen
-	time.Sleep(opts.LeafNode.ReconnectInterval + 15*opts.LeafNode.ReconnectInterval)
-	s.Shutdown()
-
-	content, err = ioutil.ReadFile(log)
-	if err != nil {
-		t.Fatalf("Error reading log file: %v", err)
-	}
-
 	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
 		t.Helper()
-		present := bytes.Contains(content, []byte(fmt.Sprintf("%s %q (attempt %d)", txt, host, attempt)))
-		if shouldBeThere && !present {
-			t.Fatalf("Did not find expected log statement (%s %q) for attempt %d: %s", txt, host, attempt, content)
-		} else if !shouldBeThere && present {
-			t.Fatalf("Log statement (%s %q) for attempt %d should not be present: %s", txt, host, attempt, content)
-		}
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			content, err := os.ReadFile(log)
+			if err != nil {
+				return fmt.Errorf("Error reading log file: %v", err)
+			}
+			present := bytes.Contains(content, []byte(fmt.Sprintf("%s %q (attempt %d)", txt, host, attempt)))
+			if shouldBeThere && !present {
+				return fmt.Errorf("Did not find expected log statement (%s %q) for attempt %d: %s", txt, host, attempt, content)
+			} else if !shouldBeThere && present {
+				return fmt.Errorf("Log statement (%s %q) for attempt %d should not be present: %s", txt, host, attempt, content)
+			}
+			return nil
+		})
 	}
 
 	for _, test := range []testConnect{
@@ -1504,21 +1878,24 @@ func TestReconnectErrorReports(t *testing.T) {
 		})
 	}
 
-	os.Remove(log)
+	s.Shutdown()
+	removeFile(t, log)
 
 	// Now try with gateways
 	csOpts.LeafNode.Port = 0
+	csOpts.Cluster.Name = "B"
 	csOpts.Gateway.Name = "B"
 	csOpts.Gateway.Port = -1
 	cs = RunServer(csOpts)
 
 	opts.LeafNode.Remotes = nil
+	opts.Cluster.Name = "A"
 	opts.Gateway.Name = "A"
 	opts.Gateway.Port = -1
 	remoteGWPort := cs.GatewayAddr().Port
 	u, _ = url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", remoteGWPort))
 	opts.Gateway.Gateways = []*RemoteGatewayOpts{
-		&RemoteGatewayOpts{
+		{
 			Name: "B",
 			URLs: []*url.URL{u},
 		},
@@ -1532,15 +1909,6 @@ func TestReconnectErrorReports(t *testing.T) {
 
 	// Now stop server s is connecting to
 	cs.Shutdown()
-
-	// Wait long enough for the number of recurring attempts to happen
-	time.Sleep(2*gatewayReconnectDelay + 15*gatewayConnectDelay)
-	s.Shutdown()
-
-	content, err = ioutil.ReadFile(log)
-	if err != nil {
-		t.Fatalf("Error reading log file: %v", err)
-	}
 
 	connTxt := fmt.Sprintf("Connecting to explicit gateway \"B\" (127.0.0.1:%d) at 127.0.0.1:%d", remoteGWPort, remoteGWPort)
 	dbgConnTxt := fmt.Sprintf("[DBG] %s", connTxt)
@@ -1568,4 +1936,135 @@ func TestReconnectErrorReports(t *testing.T) {
 			checkContent(t, errErrTxt, test.attempt, test.errExpected)
 		})
 	}
+}
+
+func TestServerLogsConfigurationFile(t *testing.T) {
+	file := createTempFile(t, "nats_server_log_")
+	file.Close()
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+	port: -1
+	logfile: '%s'
+	`, file.Name())))
+
+	o := LoadConfig(conf)
+	o.ConfigFile = file.Name()
+	o.NoLog = false
+	s := RunServer(o)
+	s.Shutdown()
+
+	log, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatalf("Error reading log file: %v", err)
+	}
+	if !bytes.Contains(log, []byte(fmt.Sprintf("Using configuration file: %s", file.Name()))) {
+		t.Fatalf("Config file location was not reported in log: %s", log)
+	}
+}
+
+func TestServerRateLimitLogging(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+
+	s.changeRateLimitLogInterval(100 * time.Millisecond)
+
+	l := &captureWarnLogger{warn: make(chan string, 100)}
+	s.SetLogger(l, false, false)
+
+	s.RateLimitWarnf("Warning number 1")
+	s.RateLimitWarnf("Warning number 2")
+	s.RateLimitWarnf("Warning number 1")
+	s.RateLimitWarnf("Warning number 2")
+
+	checkLog := func(c1, c2 *client) {
+		t.Helper()
+
+		nb1 := "Warning number 1"
+		nb2 := "Warning number 2"
+		gotOne := 0
+		gotTwo := 0
+		for done := false; !done; {
+			select {
+			case w := <-l.warn:
+				if strings.Contains(w, nb1) {
+					gotOne++
+				} else if strings.Contains(w, nb2) {
+					gotTwo++
+				}
+			case <-time.After(150 * time.Millisecond):
+				done = true
+			}
+		}
+		if gotOne != 1 {
+			t.Fatalf("Should have had only 1 warning for nb1, got %v", gotOne)
+		}
+		if gotTwo != 1 {
+			t.Fatalf("Should have had only 1 warning for nb2, got %v", gotTwo)
+		}
+
+		// Wait for more than the expiration interval
+		time.Sleep(200 * time.Millisecond)
+		if c1 == nil {
+			s.RateLimitWarnf(nb1)
+		} else {
+			c1.RateLimitWarnf(nb1)
+			c2.RateLimitWarnf(nb1)
+		}
+		gotOne = 0
+		for {
+			select {
+			case w := <-l.warn:
+				if strings.Contains(w, nb1) {
+					gotOne++
+				}
+			case <-time.After(200 * time.Millisecond):
+				if gotOne == 0 {
+					t.Fatalf("Warning was still suppressed")
+				} else if gotOne > 1 {
+					t.Fatalf("Should have had only 1 warning for nb1, got %v", gotOne)
+				} else {
+					// OK! we are done
+					return
+				}
+			}
+		}
+	}
+
+	checkLog(nil, nil)
+
+	nc1 := natsConnect(t, s.ClientURL(), nats.Name("c1"))
+	defer nc1.Close()
+	nc2 := natsConnect(t, s.ClientURL(), nats.Name("c2"))
+	defer nc2.Close()
+
+	var c1 *client
+	var c2 *client
+	s.mu.Lock()
+	for _, cli := range s.clients {
+		cli.mu.Lock()
+		switch cli.opts.Name {
+		case "c1":
+			c1 = cli
+		case "c2":
+			c2 = cli
+		}
+		cli.mu.Unlock()
+		if c1 != nil && c2 != nil {
+			break
+		}
+	}
+	s.mu.Unlock()
+	if c1 == nil || c2 == nil {
+		t.Fatal("Did not find the clients")
+	}
+
+	// Wait for more than the expiration interval
+	time.Sleep(200 * time.Millisecond)
+
+	c1.RateLimitWarnf("Warning number 1")
+	c1.RateLimitWarnf("Warning number 2")
+	c2.RateLimitWarnf("Warning number 1")
+	c2.RateLimitWarnf("Warning number 2")
+
+	checkLog(c1, c2)
 }

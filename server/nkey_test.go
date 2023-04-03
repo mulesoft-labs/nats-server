@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	mrand "math/rand"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +37,7 @@ type nonceInfo struct {
 // This is a seed for a user. We can extract public and private keys from this for testing.
 var seed = []byte("SUAKYRHVIOREXV7EUZTBHUHL7NUMHPMAS7QMDU3GTIUWEI5LDNOXD43IZY")
 
-func nkeyBasicSetup() (*Server, *client, *bufio.Reader, string) {
+func nkeyBasicSetup() (*Server, *testAsyncClient, *bufio.Reader, string) {
 	kp, _ := nkeys.FromSeed(seed)
 	pub, _ := kp.PublicKey()
 	opts := defaultServerOptions
@@ -46,7 +45,7 @@ func nkeyBasicSetup() (*Server, *client, *bufio.Reader, string) {
 	return rawSetup(opts)
 }
 
-func mixedSetup() (*Server, *client, *bufio.Reader, string) {
+func mixedSetup() (*Server, *testAsyncClient, *bufio.Reader, string) {
 	kp, _ := nkeys.FromSeed(seed)
 	pub, _ := kp.PublicKey()
 	opts := defaultServerOptions
@@ -55,8 +54,31 @@ func mixedSetup() (*Server, *client, *bufio.Reader, string) {
 	return rawSetup(opts)
 }
 
+func TestServerInfoNonceAlwaysEnabled(t *testing.T) {
+	opts := defaultServerOptions
+	opts.AlwaysEnableNonce = true
+	s, c, _, l := rawSetup(opts)
+	defer s.WaitForShutdown()
+	defer s.Shutdown()
+	defer c.close()
+
+	if !strings.HasPrefix(l, "INFO ") {
+		t.Fatalf("INFO response incorrect: %s\n", l)
+	}
+
+	var info nonceInfo
+	err := json.Unmarshal([]byte(l[5:]), &info)
+	if err != nil {
+		t.Fatalf("Could not parse INFO json: %v\n", err)
+	}
+	if info.Nonce == "" {
+		t.Fatalf("Expected a non-empty nonce with AlwaysEnableNonce set")
+	}
+}
+
 func TestServerInfoNonce(t *testing.T) {
-	_, l := setUpClientWithResponse()
+	c, l := setUpClientWithResponse()
+	defer c.close()
 	if !strings.HasPrefix(l, "INFO ") {
 		t.Fatalf("INFO response incorrect: %s\n", l)
 	}
@@ -71,7 +93,8 @@ func TestServerInfoNonce(t *testing.T) {
 	}
 
 	// Now setup server with auth and nkeys to trigger nonce generation
-	s, _, _, l := nkeyBasicSetup()
+	s, c, _, l := nkeyBasicSetup()
+	defer c.close()
 
 	if !strings.HasPrefix(l, "INFO ") {
 		t.Fatalf("INFO response incorrect: %s\n", l)
@@ -88,7 +111,8 @@ func TestServerInfoNonce(t *testing.T) {
 	// Make sure new clients get new nonces
 	oldNonce := info.Nonce
 
-	_, _, l = newClientForServer(s)
+	c, _, l = newClientForServer(s)
+	defer c.close()
 
 	err = json.Unmarshal([]byte(l[5:]), &info)
 	if err != nil {
@@ -104,9 +128,10 @@ func TestServerInfoNonce(t *testing.T) {
 
 func TestNkeyClientConnect(t *testing.T) {
 	s, c, cr, _ := nkeyBasicSetup()
+	defer c.close()
 	// Send CONNECT with no signature or nkey, should fail.
-	connectOp := []byte("CONNECT {\"verbose\":true,\"pedantic\":true}\r\n")
-	go c.parse(connectOp)
+	connectOp := "CONNECT {\"verbose\":true,\"pedantic\":true}\r\n"
+	c.parseAsync(connectOp)
 	l, _ := cr.ReadString('\n')
 	if !strings.HasPrefix(l, "-ERR ") {
 		t.Fatalf("Expected an error")
@@ -117,9 +142,9 @@ func TestNkeyClientConnect(t *testing.T) {
 
 	// Send nkey but no signature
 	c, cr, _ = newClientForServer(s)
+	defer c.close()
 	cs := fmt.Sprintf("CONNECT {\"nkey\":%q, \"verbose\":true,\"pedantic\":true}\r\n", pubKey)
-	connectOp = []byte(cs)
-	go c.parse(connectOp)
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "-ERR ") {
 		t.Fatalf("Expected an error")
@@ -127,8 +152,9 @@ func TestNkeyClientConnect(t *testing.T) {
 
 	// Now improperly sign etc.
 	c, cr, _ = newClientForServer(s)
+	defer c.close()
 	cs = fmt.Sprintf("CONNECT {\"nkey\":%q,\"sig\":%q,\"verbose\":true,\"pedantic\":true}\r\n", pubKey, "bad_sig")
-	go c.parse([]byte(cs))
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "-ERR ") {
 		t.Fatalf("Expected an error")
@@ -136,6 +162,7 @@ func TestNkeyClientConnect(t *testing.T) {
 
 	// Now properly sign the nonce
 	c, cr, l = newClientForServer(s)
+	defer c.close()
 	// Check for Nonce
 	var info nonceInfo
 	err := json.Unmarshal([]byte(l[5:]), &info)
@@ -153,7 +180,7 @@ func TestNkeyClientConnect(t *testing.T) {
 
 	// PING needed to flush the +OK to us.
 	cs = fmt.Sprintf("CONNECT {\"nkey\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", pubKey, sig)
-	go c.parse([]byte(cs))
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
@@ -162,9 +189,9 @@ func TestNkeyClientConnect(t *testing.T) {
 
 func TestMixedClientConnect(t *testing.T) {
 	s, c, cr, _ := mixedSetup()
+	defer c.close()
 	// Normal user/pass
-	// PING needed to flush the +OK to us.
-	go c.parse([]byte("CONNECT {\"user\":\"derek\",\"pass\":\"foo\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n"))
+	c.parseAsync("CONNECT {\"user\":\"derek\",\"pass\":\"foo\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n")
 	l, _ := cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
@@ -174,6 +201,7 @@ func TestMixedClientConnect(t *testing.T) {
 	pubKey, _ := kp.PublicKey()
 
 	c, cr, l = newClientForServer(s)
+	defer c.close()
 	// Check for Nonce
 	var info nonceInfo
 	err := json.Unmarshal([]byte(l[5:]), &info)
@@ -191,7 +219,7 @@ func TestMixedClientConnect(t *testing.T) {
 
 	// PING needed to flush the +OK to us.
 	cs := fmt.Sprintf("CONNECT {\"nkey\":%q,\"sig\":\"%s\",\"verbose\":true,\"pedantic\":true}\r\nPING\r\n", pubKey, sig)
-	go c.parse([]byte(cs))
+	c.parseAsync(cs)
 	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "+OK") {
 		t.Fatalf("Expected an OK, got: %v", l)
@@ -206,7 +234,6 @@ func TestMixedClientConfig(t *testing.T) {
         {user: alice, password: foo}
       ]
     }`))
-	defer os.Remove(confFileName)
 	opts, err := ProcessConfigFile(confFileName)
 	if err != nil {
 		t.Fatalf("Received an error processing config file: %v", err)

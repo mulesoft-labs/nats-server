@@ -1,4 +1,4 @@
-// Copyright 2013-2019 The NATS Authors
+// Copyright 2013-2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,9 +15,11 @@ package server
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -32,7 +34,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/nats-io/jwt"
+	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
@@ -43,25 +45,42 @@ const CLUSTER_PORT = -1
 
 func DefaultMonitorOptions() *Options {
 	return &Options{
-		Host:       "127.0.0.1",
-		Port:       CLIENT_PORT,
-		HTTPHost:   "127.0.0.1",
-		HTTPPort:   MONITOR_PORT,
-		ServerName: "monitor_server",
-		NoLog:      true,
-		NoSigs:     true,
+		Host:         "127.0.0.1",
+		Port:         CLIENT_PORT,
+		HTTPHost:     "127.0.0.1",
+		HTTPPort:     MONITOR_PORT,
+		HTTPBasePath: "/",
+		ServerName:   "monitor_server",
+		NoLog:        true,
+		NoSigs:       true,
+		Tags:         []string{"tag"},
 	}
 }
 
 func runMonitorServer() *Server {
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	return RunServer(opts)
+}
+
+func runMonitorServerWithAccounts() *Server {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	aA := NewAccount("A")
+	aB := NewAccount("B")
+	opts.Accounts = append(opts.Accounts, aA, aB)
+	opts.Users = append(opts.Users,
+		&User{Username: "a", Password: "a", Account: aA},
+		&User{Username: "b", Password: "b", Account: aB})
 	return RunServer(opts)
 }
 
 func runMonitorServerNoHTTPPort() *Server {
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
 	opts.HTTPPort = 0
 	return RunServer(opts)
 }
@@ -124,6 +143,7 @@ var (
 	appJSONContent = "application/json"
 	appJSContent   = "application/javascript"
 	textPlain      = "text/plain; charset=utf-8"
+	textHTML       = "text/html; charset=utf-8"
 )
 
 func readBodyEx(t *testing.T, url string, status int, content string) []byte {
@@ -139,11 +159,24 @@ func readBodyEx(t *testing.T, url string, status int, content string) []byte {
 	if ct != content {
 		stackFatalf(t, "Expected %s content-type, got %s\n", content, ct)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		stackFatalf(t, "Got an error reading the body: %v\n", err)
 	}
 	return body
+}
+
+func TestHTTPBasePath(t *testing.T) {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	opts.HTTPBasePath = "/nats"
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/nats", s.MonitorAddr().Port)
+	readBodyEx(t, url, http.StatusOK, textHTML)
 }
 
 func readBody(t *testing.T, url string) []byte {
@@ -165,6 +198,26 @@ func pollVarz(t *testing.T, s *Server, mode int, url string, opts *VarzOptions) 
 		t.Fatalf("Error on Varz: %v", err)
 	}
 	return v
+}
+
+// https://github.com/nats-io/nats-server/issues/2170
+// Just the ever increasing subs part.
+func TestVarzSubscriptionsResetProperly(t *testing.T) {
+	// Run with JS to create a bunch of subs to start.
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.JetStream = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	// This bug seems to only happen via the http endpoint, not direct calls.
+	// Every time you call it doubles.
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	osubs := pollVarz(t, s, 0, url, nil).Subscriptions
+	// Make sure we get same number back.
+	if v := pollVarz(t, s, 0, url, nil); v.Subscriptions != osubs {
+		t.Fatalf("Expected subs to stay the same, %d vs %d", osubs, v.Subscriptions)
+	}
 }
 
 func TestHandleVarz(t *testing.T) {
@@ -213,6 +266,9 @@ func TestHandleVarz(t *testing.T) {
 		}
 		if v.Name != "monitor_server" {
 			t.Fatal("Expected ServerName to be 'monitor_server'")
+		}
+		if !v.Tags.Contains("tag") {
+			t.Fatal("Expected tags to be 'tag'")
 		}
 	}
 
@@ -301,6 +357,9 @@ func TestConnz(t *testing.T) {
 		if len(ci.Subs) != 0 {
 			t.Fatalf("Expected subs of 0, got %v\n", ci.Subs)
 		}
+		if len(ci.SubsDetail) != 0 {
+			t.Fatalf("Expected subsdetail of 0, got %v\n", ci.SubsDetail)
+		}
 		if ci.InMsgs != 1 {
 			t.Fatalf("Expected InMsgs of 1, got %v\n", ci.InMsgs)
 		}
@@ -328,8 +387,10 @@ func TestConnz(t *testing.T) {
 		if ci.Idle == "" {
 			t.Fatal("Expected Idle to be valid\n")
 		}
-		if ci.RTT != "" {
-			t.Fatal("Expected RTT to NOT be set for new connection\n")
+		// This is a change, we now expect them to be set for connections when the
+		// client sends a connect.
+		if ci.RTT == "" {
+			t.Fatal("Expected RTT to be set for new connection\n")
 		}
 	}
 
@@ -371,6 +432,57 @@ func TestConnzWithSubs(t *testing.T) {
 		ci := c.Conns[0]
 		if len(ci.Subs) != 1 || ci.Subs[0] != "hello.foo" {
 			t.Fatalf("Expected subs of 1, got %v\n", ci.Subs)
+		}
+	}
+}
+
+func TestConnzWithSubsDetail(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	nc := createClientConnSubscribeAndPublish(t, s)
+	defer nc.Close()
+
+	nc.Subscribe("hello.foo", func(m *nats.Msg) {})
+	ensureServerActivityRecorded(t, nc)
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		c := pollConz(t, s, mode, url+"connz?subs=detail", &ConnzOptions{SubscriptionsDetail: true})
+		// Test inside details of each connection
+		ci := c.Conns[0]
+		if len(ci.SubsDetail) != 1 || ci.SubsDetail[0].Subject != "hello.foo" {
+			t.Fatalf("Expected subsdetail of 1, got %v\n", ci.Subs)
+		}
+	}
+}
+
+func TestClosedConnzWithSubsDetail(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	nc := createClientConnSubscribeAndPublish(t, s)
+
+	nc.Subscribe("hello.foo", func(m *nats.Msg) {})
+	ensureServerActivityRecorded(t, nc)
+	nc.Close()
+
+	s.mu.Lock()
+	for len(s.clients) != 0 {
+		s.mu.Unlock()
+		<-time.After(100 * time.Millisecond)
+		s.mu.Lock()
+	}
+	s.mu.Unlock()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		c := pollConz(t, s, mode, url+"connz?state=closed&subs=detail", &ConnzOptions{State: ConnClosed,
+			SubscriptionsDetail: true})
+		// Test inside details of each connection
+		ci := c.Conns[0]
+		if len(ci.SubsDetail) != 1 || ci.SubsDetail[0].Subject != "hello.foo" {
+			t.Fatalf("Expected subsdetail of 1, got %v\n", ci.Subs)
 		}
 	}
 }
@@ -487,7 +599,8 @@ func TestConnzRTT(t *testing.T) {
 		if rtt <= 0 {
 			t.Fatal("Expected RTT to be valid and non-zero\n")
 		}
-		if rtt > 20*time.Millisecond || rtt < 100*time.Nanosecond {
+		if (runtime.GOOS == "windows" && rtt > 20*time.Millisecond) ||
+			rtt > 20*time.Millisecond || rtt < 100*time.Nanosecond {
 			t.Fatalf("Invalid RTT of %s\n", ci.RTT)
 		}
 	}
@@ -505,6 +618,11 @@ func TestConnzLastActivity(t *testing.T) {
 	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	url += "connz?subs=1"
 	opts := &ConnzOptions{Subscriptions: true}
+
+	var sleepTime time.Duration
+	if runtime.GOOS == "windows" {
+		sleepTime = 10 * time.Millisecond
+	}
 
 	testActivity := func(mode int) {
 		ncFoo := createClientConnWithName(t, "foo", s)
@@ -534,6 +652,8 @@ func TestConnzLastActivity(t *testing.T) {
 		ensureServerActivityRecorded(t, ncFoo)
 		ensureServerActivityRecorded(t, ncBar)
 
+		time.Sleep(sleepTime)
+
 		// Sub should trigger update.
 		sub, _ := ncFoo.Subscribe("hello.world", func(m *nats.Msg) {})
 		ensureServerActivityRecorded(t, ncFoo)
@@ -544,6 +664,8 @@ func TestConnzLastActivity(t *testing.T) {
 			t.Fatalf("Subscribe should have triggered update to LastActivity %+v\n", ciFoo)
 		}
 		fooLA = nextLA
+
+		time.Sleep(sleepTime)
 
 		// Publish and Message Delivery should trigger as well. So both connections
 		// should have updates.
@@ -557,7 +679,6 @@ func TestConnzLastActivity(t *testing.T) {
 		if barLA.Equal(nextLA) {
 			t.Fatalf("Publish should have triggered update to LastActivity\n")
 		}
-		barLA = nextLA
 
 		// Message delivery on ncFoo should have triggered as well.
 		nextLA = ciFoo.LastActivity
@@ -565,6 +686,8 @@ func TestConnzLastActivity(t *testing.T) {
 			t.Fatalf("Message delivery should have triggered update to LastActivity\n")
 		}
 		fooLA = nextLA
+
+		time.Sleep(sleepTime)
 
 		// Unsub should trigger as well
 		sub.Unsubscribe()
@@ -829,6 +952,7 @@ func TestConnzSortedBySubs(t *testing.T) {
 func TestConnzSortedByLast(t *testing.T) {
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
 	s := RunServer(opts)
 	defer s.Shutdown()
 
@@ -962,9 +1086,9 @@ func TestConnzSortedByStopTimeClosedConn(t *testing.T) {
 	}
 	checkClosedConns(t, s, 4, time.Second)
 
-	//Now adjust the Stop times for these with some random values.
+	// Now adjust the Stop times for these with some random values.
 	s.mu.Lock()
-	now := time.Now()
+	now := time.Now().UTC()
 	ccs := s.closed.closedClients()
 	for _, cc := range ccs {
 		newStop := now.Add(time.Duration(rand.Int()%120) * -time.Minute)
@@ -1007,7 +1131,7 @@ func TestConnzSortedByReason(t *testing.T) {
 	}
 	checkClosedConns(t, s, 20, time.Second)
 
-	//Now adjust the Reasons for these with some random values.
+	// Now adjust the Reasons for these with some random values.
 	s.mu.Lock()
 	ccs := s.closed.closedClients()
 	max := int(ServerShutdown)
@@ -1167,6 +1291,8 @@ func pollRoutez(t *testing.T, s *Server, mode int, url string, opts *RoutezOptio
 func TestConnzWithRoutes(t *testing.T) {
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	opts.Cluster.Name = "A"
 	opts.Cluster.Host = "127.0.0.1"
 	opts.Cluster.Port = CLUSTER_PORT
 
@@ -1177,15 +1303,18 @@ func TestConnzWithRoutes(t *testing.T) {
 		Host: "127.0.0.1",
 		Port: -1,
 		Cluster: ClusterOpts{
+			Name: "A",
 			Host: "127.0.0.1",
 			Port: -1,
 		},
-		NoLog:  true,
-		NoSigs: true,
+		NoLog:           true,
+		NoSigs:          true,
+		NoSystemAccount: true,
 	}
 	routeURL, _ := url.Parse(fmt.Sprintf("nats-route://127.0.0.1:%d", s.ClusterAddr().Port))
 	opts.Routes = []*url.URL{routeURL}
 
+	start := time.Now()
 	sc := RunServer(opts)
 	defer sc.Shutdown()
 
@@ -1197,10 +1326,10 @@ func TestConnzWithRoutes(t *testing.T) {
 		// Test contents..
 		// Make sure routes don't show up under connz, but do under routez
 		if c.NumConns != 0 {
-			t.Fatalf("Expected 0 connections, got %d\n", c.NumConns)
+			t.Fatalf("Expected 0 connections, got %d", c.NumConns)
 		}
 		if c.Conns == nil || len(c.Conns) != 0 {
-			t.Fatalf("Expected 0 connections in array, got %p\n", c.Conns)
+			t.Fatalf("Expected 0 connections in array, got %p", c.Conns)
 		}
 	}
 
@@ -1212,23 +1341,38 @@ func TestConnzWithRoutes(t *testing.T) {
 	checkExpectedSubs(t, 1, s, sc)
 
 	// Now check routez
-	urls := []string{"routez", "routez?subs=1"}
+	urls := []string{"routez", "routez?subs=1", "routez?subs=detail"}
 	for subs, urlSuffix := range urls {
 		for mode := 0; mode < 2; mode++ {
-			rz := pollRoutez(t, s, mode, url+urlSuffix, &RoutezOptions{Subscriptions: subs == 1})
+			rz := pollRoutez(t, s, mode, url+urlSuffix, &RoutezOptions{Subscriptions: subs == 1, SubscriptionsDetail: subs == 2})
 
 			if rz.NumRoutes != 1 {
-				t.Fatalf("Expected 1 route, got %d\n", rz.NumRoutes)
+				t.Fatalf("Expected 1 route, got %d", rz.NumRoutes)
 			}
 
 			if len(rz.Routes) != 1 {
-				t.Fatalf("Expected route array of 1, got %v\n", len(rz.Routes))
+				t.Fatalf("Expected route array of 1, got %v", len(rz.Routes))
 			}
 
 			route := rz.Routes[0]
 
 			if route.DidSolicit {
-				t.Fatalf("Expected unsolicited route, got %v\n", route.DidSolicit)
+				t.Fatalf("Expected unsolicited route, got %v", route.DidSolicit)
+			}
+
+			if route.Start.IsZero() {
+				t.Fatalf("Expected Start to be set, got %+v", route)
+			} else if route.Start.Before(start) {
+				t.Fatalf("Unexpected start time: route was started around %v, got %v", start, route.Start)
+			}
+			if route.LastActivity.IsZero() {
+				t.Fatalf("Expected LastActivity to be set, got %+v", route)
+			}
+			if route.Uptime == _EMPTY_ {
+				t.Fatalf("Expected Uptime to be set, it was not")
+			}
+			if route.Idle == _EMPTY_ {
+				t.Fatalf("Expected Idle to be set, it was not")
 			}
 
 			// Don't ask for subs, so there should not be any
@@ -1236,9 +1380,13 @@ func TestConnzWithRoutes(t *testing.T) {
 				if len(route.Subs) != 0 {
 					t.Fatalf("There should not be subs, got %v", len(route.Subs))
 				}
-			} else {
-				if len(route.Subs) != 1 {
+			} else if subs == 1 {
+				if len(route.Subs) != 1 && len(route.SubsDetail) != 0 {
 					t.Fatalf("There should be 1 sub, got %v", len(route.Subs))
+				}
+			} else if subs == 2 {
+				if len(route.SubsDetail) != 1 && len(route.Subs) != 0 {
+					t.Fatalf("There should be 1 sub, got %v", len(route.SubsDetail))
 				}
 			}
 		}
@@ -1399,6 +1547,115 @@ func TestSubszTestPubSubject(t *testing.T) {
 	readBodyEx(t, testUrl+"test=foo..bar", http.StatusBadRequest, textPlain)
 }
 
+func TestSubszMultiAccount(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+
+	ncA.Subscribe("foo.*", func(m *nats.Msg) {})
+	ncA.Subscribe("foo.bar", func(m *nats.Msg) {})
+	ncA.Subscribe("foo.foo", func(m *nats.Msg) {})
+
+	ncA.Publish("foo.bar", []byte("Hello"))
+	ncA.Publish("foo.baz", []byte("Hello"))
+	ncA.Publish("foo.foo", []byte("Hello"))
+
+	ncA.Flush()
+
+	ncB := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncB.Close()
+
+	ncB.Subscribe("foo.*", func(m *nats.Msg) {})
+	ncB.Subscribe("foo.bar", func(m *nats.Msg) {})
+	ncB.Subscribe("foo.foo", func(m *nats.Msg) {})
+
+	ncB.Publish("foo.bar", []byte("Hello"))
+	ncB.Publish("foo.baz", []byte("Hello"))
+	ncB.Publish("foo.foo", []byte("Hello"))
+
+	ncB.Flush()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		sl := pollSubsz(t, s, mode, url+"subsz?subs=1", &SubszOptions{Subscriptions: true})
+		if sl.NumSubs != 6 {
+			t.Fatalf("Expected NumSubs of 6, got %d\n", sl.NumSubs)
+		}
+		if sl.Total != 6 {
+			t.Fatalf("Expected Total of 6, got %d\n", sl.Total)
+		}
+		if len(sl.Subs) != 6 {
+			t.Fatalf("Expected subscription details for 6 subs, got %d\n", len(sl.Subs))
+		}
+		for _, sd := range sl.Subs {
+			if sd.Account != "A" && sd.Account != "B" {
+				t.Fatalf("Expected account information to be present and be 'A' or 'B', got %q", sd.Account)
+			}
+		}
+
+		// Now make sure we can filter on account.
+		sl = pollSubsz(t, s, mode, url+"subsz?subs=1&acc=A", &SubszOptions{Account: "A", Subscriptions: true})
+		if sl.NumSubs != 3 {
+			t.Fatalf("Expected NumSubs of 3, got %d\n", sl.NumSubs)
+		}
+		if sl.Total != 3 {
+			t.Fatalf("Expected Total of 6, got %d\n", sl.Total)
+		}
+		if len(sl.Subs) != 3 {
+			t.Fatalf("Expected subscription details for 6 subs, got %d\n", len(sl.Subs))
+		}
+		for _, sd := range sl.Subs {
+			if sd.Account != "A" {
+				t.Fatalf("Expected account information to be present and be 'A', got %q", sd.Account)
+			}
+		}
+	}
+}
+
+func TestSubszMultiAccountWithOffsetAndLimit(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	ncA := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer ncA.Close()
+
+	for i := 0; i < 200; i++ {
+		ncA.Subscribe(fmt.Sprintf("foo.%d", i), func(m *nats.Msg) {})
+	}
+	ncA.Flush()
+
+	ncB := createClientConnWithUserSubscribeAndPublish(t, s, "b", "b")
+	defer ncB.Close()
+
+	for i := 0; i < 200; i++ {
+		ncB.Subscribe(fmt.Sprintf("foo.%d", i), func(m *nats.Msg) {})
+	}
+	ncB.Flush()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		sl := pollSubsz(t, s, mode, url+"subsz?subs=1&offset=10&limit=100", &SubszOptions{Subscriptions: true, Offset: 10, Limit: 100})
+		if sl.NumSubs != 400 {
+			t.Fatalf("Expected NumSubs of 200, got %d\n", sl.NumSubs)
+		}
+		if sl.Total != 100 {
+			t.Fatalf("Expected Total of 100, got %d\n", sl.Total)
+		}
+		if sl.Offset != 10 {
+			t.Fatalf("Expected Offset of 10, got %d\n", sl.Offset)
+		}
+		if sl.Limit != 100 {
+			t.Fatalf("Expected Total of 100, got %d\n", sl.Limit)
+		}
+		if len(sl.Subs) != 100 {
+			t.Fatalf("Expected subscription details for 100 subs, got %d\n", len(sl.Subs))
+		}
+	}
+}
+
 // Tests handle root
 func TestHandleRoot(t *testing.T) {
 	s := runMonitorServer()
@@ -1411,11 +1668,12 @@ func TestHandleRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("Expected a %d response, got %d\n", http.StatusOK, resp.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Expected no error reading body: Got %v\n", err)
 	}
@@ -1429,7 +1687,6 @@ func TestHandleRoot(t *testing.T) {
 	if !strings.Contains(ct, "text/html") {
 		t.Fatalf("Expected text/html response, got %s\n", ct)
 	}
-	defer resp.Body.Close()
 }
 
 func TestConnzWithNamedClient(t *testing.T) {
@@ -1623,6 +1880,7 @@ func TestConnzClosedConnsBadTLSClient(t *testing.T) {
 
 	var err error
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
 	opts.TLSTimeout = 1.5 // 1.5 seconds
 	opts.TLSConfig, err = GenTLSConfig(tc)
 	if err != nil {
@@ -1663,8 +1921,13 @@ func TestConnzClosedConnsBadTLSClient(t *testing.T) {
 }
 
 // Create a connection to test ConnInfo
-func createClientConnSubscribeAndPublish(t *testing.T, s *Server) *nats.Conn {
-	natsURL := fmt.Sprintf("nats://127.0.0.1:%d", s.Addr().(*net.TCPAddr).Port)
+func createClientConnWithUserSubscribeAndPublish(t *testing.T, s *Server, user, pwd string) *nats.Conn {
+	natsURL := ""
+	if user == "" {
+		natsURL = fmt.Sprintf("nats://127.0.0.1:%d", s.Addr().(*net.TCPAddr).Port)
+	} else {
+		natsURL = fmt.Sprintf("nats://%s:%s@127.0.0.1:%d", user, pwd, s.Addr().(*net.TCPAddr).Port)
+	}
 	client := nats.DefaultOptions
 	client.Servers = []string{natsURL}
 	nc, err := client.Connect()
@@ -1685,6 +1948,10 @@ func createClientConnSubscribeAndPublish(t *testing.T, s *Server) *nats.Conn {
 	close(ch)
 	nc.Flush()
 	return nc
+}
+
+func createClientConnSubscribeAndPublish(t *testing.T, s *Server) *nats.Conn {
+	return createClientConnWithUserSubscribeAndPublish(t, s, "", "")
 }
 
 func createClientConnWithName(t *testing.T, name string, s *Server) *nats.Conn {
@@ -1734,6 +2001,7 @@ func TestConcurrentMonitoring(t *testing.T) {
 					ech <- fmt.Sprintf("Expected no error: Got %v\n", err)
 					return
 				}
+				defer resp.Body.Close()
 				if resp.StatusCode != http.StatusOK {
 					ech <- fmt.Sprintf("Expected a %v response, got %d\n", http.StatusOK, resp.StatusCode)
 					return
@@ -1743,8 +2011,7 @@ func TestConcurrentMonitoring(t *testing.T) {
 					ech <- fmt.Sprintf("Expected application/json content-type, got %s\n", ct)
 					return
 				}
-				defer resp.Body.Close()
-				if _, err := ioutil.ReadAll(resp.Body); err != nil {
+				if _, err := io.ReadAll(resp.Body); err != nil {
 					ech <- fmt.Sprintf("Got an error reading the body: %v\n", err)
 					return
 				}
@@ -1778,6 +2045,8 @@ func TestMonitorHandler(t *testing.T) {
 func TestMonitorRoutezRace(t *testing.T) {
 	resetPreviousHTTPConnections()
 	srvAOpts := DefaultMonitorOptions()
+	srvAOpts.NoSystemAccount = true
+	srvAOpts.Cluster.Name = "B"
 	srvAOpts.Cluster.Port = -1
 	srvA := RunServer(srvAOpts)
 	defer srvA.Shutdown()
@@ -1785,7 +2054,6 @@ func TestMonitorRoutezRace(t *testing.T) {
 	srvBOpts := nextServerOpts(srvAOpts)
 	srvBOpts.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/", srvA.MonitorAddr().Port)
 	doneCh := make(chan struct{})
 	go func() {
 		defer func() {
@@ -1803,10 +2071,8 @@ func TestMonitorRoutezRace(t *testing.T) {
 	}()
 	done := false
 	for !done {
-		if resp, err := http.Get(url + "routez"); err != nil {
+		if _, err := srvA.Routez(nil); err != nil {
 			time.Sleep(10 * time.Millisecond)
-		} else {
-			resp.Body.Close()
 		}
 		select {
 		case <-doneCh:
@@ -1825,6 +2091,7 @@ func TestConnzTLSInHandshake(t *testing.T) {
 
 	var err error
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
 	opts.TLSTimeout = 1.5 // 1.5 seconds
 	opts.TLSConfig, err = GenTLSConfig(tc)
 	if err != nil {
@@ -1859,6 +2126,118 @@ func TestConnzTLSInHandshake(t *testing.T) {
 		// TLS fields should be not set
 		if conn.TLSVersion != "" || conn.TLSCipher != "" {
 			t.Fatalf("Expected TLS fields to not be set, got version:%v cipher:%v", conn.TLSVersion, conn.TLSCipher)
+		}
+	}
+}
+
+func TestConnzTLSCfg(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	tc := &TLSConfigOpts{}
+	tc.CertFile = "configs/certs/server.pem"
+	tc.KeyFile = "configs/certs/key.pem"
+
+	var err error
+	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	opts.TLSTimeout = 1.5 // 1.5 seconds
+	opts.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	opts.Gateway.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.Gateway.TLSTimeout = 1.5
+	opts.LeafNode.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.LeafNode.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	opts.LeafNode.TLSTimeout = 1.5
+	opts.Cluster.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+	opts.Cluster.TLSTimeout = 1.5
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	check := func(verify, required bool, timeout float64) {
+		t.Helper()
+		if !verify {
+			t.Fatalf("Expected tls_verify to be true")
+		}
+		if !required {
+			t.Fatalf("Expected tls_required to be true")
+		}
+		if timeout != 1.5 {
+			t.Fatalf("Expected tls_timeout to be 1.5")
+		}
+	}
+
+	start := time.Now()
+	endpoint := fmt.Sprintf("http://%s:%d/varz", opts.HTTPHost, s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		varz := pollVarz(t, s, mode, endpoint, nil)
+		duration := time.Since(start)
+		if duration >= 1500*time.Millisecond {
+			t.Fatalf("Looks like varz blocked on handshake, took %v", duration)
+		}
+		check(varz.TLSVerify, varz.TLSRequired, varz.TLSTimeout)
+		check(varz.Cluster.TLSVerify, varz.Cluster.TLSRequired, varz.Cluster.TLSTimeout)
+		check(varz.Gateway.TLSVerify, varz.Gateway.TLSRequired, varz.Gateway.TLSTimeout)
+		check(varz.LeafNode.TLSVerify, varz.LeafNode.TLSRequired, varz.LeafNode.TLSTimeout)
+	}
+}
+
+func TestConnzTLSPeerCerts(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	tc := &TLSConfigOpts{}
+	tc.CertFile = "../test/configs/certs/server-cert.pem"
+	tc.KeyFile = "../test/configs/certs/server-key.pem"
+	tc.CaFile = "../test/configs/certs/ca.pem"
+	tc.Verify = true
+	tc.Timeout = 2.0
+
+	var err error
+	opts := DefaultMonitorOptions()
+	opts.TLSConfig, err = GenTLSConfig(tc)
+	require_NoError(t, err)
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL(),
+		nats.ClientCert("../test/configs/certs/client-cert.pem", "../test/configs/certs/client-key.pem"),
+		nats.RootCAs("../test/configs/certs/ca.pem"))
+	defer nc.Close()
+
+	endpoint := fmt.Sprintf("http://%s:%d/connz", opts.HTTPHost, s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		// Without "auth" option, we should not get the details
+		connz := pollConz(t, s, mode, endpoint, nil)
+		require_True(t, len(connz.Conns) == 1)
+		c := connz.Conns[0]
+		if c.TLSPeerCerts != nil {
+			t.Fatalf("Did not expect TLSPeerCerts when auth is not specified: %+v", c.TLSPeerCerts)
+		}
+		// Now specify "auth" option
+		connz = pollConz(t, s, mode, endpoint+"?auth=1", &ConnzOptions{Username: true})
+		require_True(t, len(connz.Conns) == 1)
+		c = connz.Conns[0]
+		if c.TLSPeerCerts == nil {
+			t.Fatal("Expected TLSPeerCerts to be set, was not")
+		} else if len(c.TLSPeerCerts) != 1 {
+			t.Fatalf("Unexpected peer certificates: %+v", c.TLSPeerCerts)
+		} else {
+			for _, d := range c.TLSPeerCerts {
+				if d.Subject != "CN=localhost,OU=nats.io,O=Synadia,ST=California,C=US" {
+					t.Fatalf("Unexpected subject: %s", d.Subject)
+				}
+				if len(d.SubjectPKISha256) != 64 {
+					t.Fatalf("Unexpected spki_sha256: %s", d.SubjectPKISha256)
+				}
+				if len(d.CertSha256) != 64 {
+					t.Fatalf("Unexpected cert_sha256: %s", d.CertSha256)
+				}
+			}
 		}
 	}
 }
@@ -1931,6 +2310,8 @@ func TestClusterEmptyWhenNotDefined(t *testing.T) {
 func TestRoutezPermissions(t *testing.T) {
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	opts.Cluster.Name = "A"
 	opts.Cluster.Host = "127.0.0.1"
 	opts.Cluster.Port = -1
 	opts.Cluster.Permissions = &RoutePermissions{
@@ -1947,7 +2328,9 @@ func TestRoutezPermissions(t *testing.T) {
 	defer s1.Shutdown()
 
 	opts = DefaultMonitorOptions()
+	opts.ServerName = "monitor_server_2"
 	opts.Cluster.Host = "127.0.0.1"
+	opts.Cluster.Name = "A"
 	opts.Cluster.Port = -1
 	routeURL, _ := url.Parse(fmt.Sprintf("nats-route://127.0.0.1:%d", s1.ClusterAddr().Port))
 	opts.Routes = []*url.URL{routeURL}
@@ -2077,7 +2460,8 @@ func Benchmark_VarzHttp(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Expected no error: Got %v\n", err)
 		}
-		body, err := ioutil.ReadAll(resp.Body)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			b.Fatalf("Got an error reading the body: %v\n", err)
 		}
@@ -2160,6 +2544,7 @@ func testMonitorStructPresent(t *testing.T, tag string) {
 
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
 	s := RunServer(opts)
 	defer s.Shutdown()
 
@@ -2175,6 +2560,8 @@ func TestMonitorCluster(t *testing.T) {
 
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	opts.Cluster.Name = "A"
 	opts.Cluster.Port = -1
 	opts.Cluster.AuthTimeout = 1
 	opts.Routes = RoutesFromStr("nats://127.0.0.1:1234")
@@ -2182,10 +2569,14 @@ func TestMonitorCluster(t *testing.T) {
 	defer s.Shutdown()
 
 	expected := ClusterOptsVarz{
+		"A",
 		opts.Cluster.Host,
 		opts.Cluster.Port,
 		opts.Cluster.AuthTimeout,
 		[]string{"127.0.0.1:1234"},
+		opts.Cluster.TLSTimeout,
+		opts.Cluster.TLSConfig != nil,
+		opts.Cluster.TLSConfig != nil,
 	}
 
 	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
@@ -2201,11 +2592,12 @@ func TestMonitorCluster(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in ClusterOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = ClusterOptsVarz{"", 0, 0, nil}
+		_ = ClusterOptsVarz{"", "", 0, 0, nil, 2, false, false}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
 		// should not affect the next returned value.
+		v.Cluster.Name = "wrong"
 		v.Cluster.Host = "wrong"
 		v.Cluster.Port = 0
 		v.Cluster.AuthTimeout = 0
@@ -2220,6 +2612,8 @@ func TestMonitorClusterURLs(t *testing.T) {
 
 	o2 := DefaultOptions()
 	o2.Cluster.Host = "127.0.0.1"
+	o2.Cluster.Name = "A"
+
 	s2 := RunServer(o2)
 	defer s2.Shutdown()
 
@@ -2229,6 +2623,7 @@ func TestMonitorClusterURLs(t *testing.T) {
 		port: -1
 		http: -1
 		cluster: {
+			name: "A"
 			port: -1
 			routes [
 				%s
@@ -2237,7 +2632,6 @@ func TestMonitorClusterURLs(t *testing.T) {
 		}
 	`
 	conf := createConfFile(t, []byte(fmt.Sprintf(template, "nats://"+s2ClusterHostPort, "")))
-	defer os.Remove(conf)
 	s1, _ := RunServerWithConfig(conf)
 	defer s1.Shutdown()
 
@@ -2318,6 +2712,7 @@ func TestMonitorGateway(t *testing.T) {
 
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
 	opts.Gateway.Name = "A"
 	opts.Gateway.Port = -1
 	opts.Gateway.AuthTimeout = 1
@@ -2328,7 +2723,7 @@ func TestMonitorGateway(t *testing.T) {
 	u1, _ := url.Parse("nats://ivan:pwd@localhost:1234")
 	u2, _ := url.Parse("nats://localhost:1235")
 	opts.Gateway.Gateways = []*RemoteGatewayOpts{
-		&RemoteGatewayOpts{
+		{
 			Name:       "B",
 			TLSTimeout: 1,
 			URLs: []*url.URL{
@@ -2346,6 +2741,8 @@ func TestMonitorGateway(t *testing.T) {
 		opts.Gateway.Port,
 		opts.Gateway.AuthTimeout,
 		opts.Gateway.TLSTimeout,
+		opts.Gateway.TLSConfig != nil,
+		opts.Gateway.TLSConfig != nil,
 		opts.Gateway.Advertise,
 		opts.Gateway.ConnectRetries,
 		[]RemoteGatewayOptsVarz{{"B", 1, nil}},
@@ -2387,7 +2784,7 @@ func TestMonitorGateway(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in GatewayOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = GatewayOptsVarz{"", "", 0, 0, 0, "", 0, []RemoteGatewayOptsVarz{{"", 0, nil}}, false}
+		_ = GatewayOptsVarz{"", "", 0, 0, 0, false, false, "", 0, []RemoteGatewayOptsVarz{{"", 0, nil}}, false}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -2484,6 +2881,59 @@ func TestMonitorGatewayURLsUpdated(t *testing.T) {
 		}
 		return nil
 	})
+
+	// Now stop sb2 and make sure that its removal is reflected in varz.
+	sb2.Shutdown()
+	// Wait for it to disappear from sa.
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	// Now check that URLs in /varz get updated.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for mode := 0; mode < 2; mode++ {
+			v := pollVarz(t, sa, mode, varzURL, nil)
+			if n := len(v.Gateway.Gateways); n != 1 {
+				return fmt.Errorf("mode=%v - Expected 1 remote gateway, got %v", mode, n)
+			}
+			gw := v.Gateway.Gateways[0]
+			if n := len(gw.URLs); n != 1 {
+				return fmt.Errorf("mode=%v - Expected 1 url, got %v", mode, n)
+			}
+			u := gw.URLs[0]
+			if u != fmt.Sprintf("127.0.0.1:%d", sb1.GatewayAddr().Port) {
+				return fmt.Errorf("mode=%v - Did not get URL to sb1", mode)
+			}
+		}
+		return nil
+	})
+}
+
+func TestMonitorGatewayReportItsOwnURLs(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	// In this test, we show that if a server has its own gateway information
+	// as a remote (which is the case when remote gateway definitions is copied
+	// on all clusters), we display the defined URLs.
+	oa := testGatewayOptionsFromToWithURLs(t, "A", "A", []string{"nats://127.0.0.1:1234", "nats://127.0.0.1:1235"})
+	oa.HTTPHost = "127.0.0.1"
+	oa.HTTPPort = MONITOR_PORT
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", sa.MonitorAddr().Port)
+	// Check the /varz gateway's URLs
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, sa, mode, varzURL, nil)
+		if n := len(v.Gateway.Gateways); n != 1 {
+			t.Fatalf("mode=%v - Expected 1 remote gateway, got %v", mode, n)
+		}
+		gw := v.Gateway.Gateways[0]
+		if n := len(gw.URLs); n != 2 {
+			t.Fatalf("mode=%v - Expected 2 urls, got %v", mode, gw.URLs)
+		}
+		expected := []string{"127.0.0.1:1234", "127.0.0.1:1235"}
+		if !reflect.DeepEqual(gw.URLs, expected) {
+			t.Fatalf("mode=%v - Expected URLs %q, got %q", mode, expected, gw.URLs)
+		}
+	}
 }
 
 func TestMonitorLeafNode(t *testing.T) {
@@ -2491,13 +2941,14 @@ func TestMonitorLeafNode(t *testing.T) {
 
 	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
 	opts.LeafNode.Port = -1
 	opts.LeafNode.AuthTimeout = 1
 	opts.LeafNode.TLSTimeout = 1
 	opts.Accounts = []*Account{NewAccount("acc")}
 	u, _ := url.Parse("nats://ivan:pwd@localhost:1234")
 	opts.LeafNode.Remotes = []*RemoteLeafOpts{
-		&RemoteLeafOpts{
+		{
 			LocalAccount: "acc",
 			URLs:         []*url.URL{u},
 			TLSTimeout:   1,
@@ -2511,9 +2962,11 @@ func TestMonitorLeafNode(t *testing.T) {
 		opts.LeafNode.Port,
 		opts.LeafNode.AuthTimeout,
 		opts.LeafNode.TLSTimeout,
+		opts.LeafNode.TLSConfig != nil,
+		opts.LeafNode.TLSConfig != nil,
 		[]RemoteLeafOptsVarz{
 			{
-				"acc", 1, []string{"localhost:1234"},
+				"acc", 1, []string{"localhost:1234"}, nil,
 			},
 		},
 	}
@@ -2532,7 +2985,7 @@ func TestMonitorLeafNode(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in ClusterOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = LeafNodeOptsVarz{"", 0, 0, 0, []RemoteLeafOptsVarz{{"", 0, nil}}}
+		_ = LeafNodeOptsVarz{"", 0, 0, 0, false, false, []RemoteLeafOptsVarz{{"", 0, nil, nil}}}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -2651,6 +3104,7 @@ func TestMonitorGatewayz(t *testing.T) {
 	ob2 := testDefaultOptionsForGateway("B")
 	ob2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", sb1.ClusterAddr().Port))
 	sb2 := runGatewayServer(ob2)
+	defer sb2.Shutdown()
 
 	// Wait for sb1 and sb2 to connect
 	checkClusterFormed(t, sb1, sb2)
@@ -2769,6 +3223,9 @@ func TestMonitorGatewayz(t *testing.T) {
 }
 
 func TestMonitorGatewayzAccounts(t *testing.T) {
+	GatewayDoNotForceInterestOnlyMode(true)
+	defer GatewayDoNotForceInterestOnlyMode(false)
+
 	resetPreviousHTTPConnections()
 
 	// Create bunch of Accounts
@@ -2789,8 +3246,8 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 			name: "B"
 			port: -1
 		}
+		no_sys_acc = true
 	`, accounts)))
-	defer os.Remove(bConf)
 
 	sb, ob := RunServerWithConfig(bConf)
 	defer sb.Shutdown()
@@ -2813,8 +3270,8 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 				}
 			]
 		}
+		no_sys_acc = true
 	`, accounts, sb.GatewayAddr().Port)))
-	defer os.Remove(aConf)
 
 	sa, oa := RunServerWithConfig(aConf)
 	defer sa.Shutdown()
@@ -3132,8 +3589,7 @@ func TestMonitorGatewayzAccounts(t *testing.T) {
 }
 
 func TestMonitorRouteRTT(t *testing.T) {
-	// Do not change default PingInterval and expect RTT
-	// to still be reported
+	// Do not change default PingInterval and expect RTT to still be reported
 
 	ob := DefaultOptions()
 	sb := RunServer(ob)
@@ -3184,8 +3640,45 @@ func pollLeafz(t *testing.T, s *Server, mode int, url string, opts *LeafzOptions
 	return l
 }
 
+func TestMonitorOpJWT(t *testing.T) {
+	content := `
+	listen: "127.0.0.1:-1"
+	http: "127.0.0.1:-1"
+	operator = "../test/configs/nkeys/op.jwt"
+	resolver = MEMORY
+	`
+	conf := createConfFile(t, []byte(content))
+	sa, _ := RunServerWithConfig(conf)
+	defer sa.Shutdown()
+
+	theJWT, err := os.ReadFile("../test/configs/nkeys/op.jwt")
+	require_NoError(t, err)
+	theJWT = []byte(strings.Split(string(theJWT), "\n")[1])
+	claim, err := jwt.DecodeOperatorClaims(string(theJWT))
+	require_NoError(t, err)
+
+	pollURL := fmt.Sprintf("http://127.0.0.1:%d/varz", sa.MonitorAddr().Port)
+	for pollMode := 1; pollMode < 2; pollMode++ {
+		l := pollVarz(t, sa, pollMode, pollURL, nil)
+
+		if len(l.TrustedOperatorsJwt) != 1 {
+			t.Fatalf("Expected one operator jwt")
+		}
+		if len(l.TrustedOperatorsClaim) != 1 {
+			t.Fatalf("Expected one operator claim")
+		}
+		if l.TrustedOperatorsJwt[0] != string(theJWT) {
+			t.Fatalf("Expected operator to be identical to configuration")
+		}
+		if !reflect.DeepEqual(l.TrustedOperatorsClaim[0], claim) {
+			t.Fatal("claims need to be equal")
+		}
+	}
+}
+
 func TestMonitorLeafz(t *testing.T) {
 	content := `
+	server_name: "hub"
 	listen: "127.0.0.1:-1"
 	http: "127.0.0.1:-1"
 	operator = "../test/configs/nkeys/op.jwt"
@@ -3196,7 +3689,6 @@ func TestMonitorLeafz(t *testing.T) {
 	}
 	`
 	conf := createConfFile(t, []byte(content))
-	defer os.Remove(conf)
 	sb, ob := RunServerWithConfig(conf)
 	defer sb.Shutdown()
 
@@ -3215,14 +3707,14 @@ func TestMonitorLeafz(t *testing.T) {
 		return acc, creds
 	}
 	acc1, mycreds1 := createAcc(t)
-	defer os.Remove(mycreds1)
 	acc2, mycreds2 := createAcc(t)
-	defer os.Remove(mycreds2)
+	leafName := "my-leaf-node"
 
 	content = `
 		port: -1
 		http: "127.0.0.1:-1"
 		ping_interval = 1
+		server_name: %s
 		accounts {
 			%s {
 				users [
@@ -3240,22 +3732,22 @@ func TestMonitorLeafz(t *testing.T) {
 				{
 					account: "%s"
 					url: nats-leaf://127.0.0.1:%d
-					credentials: "%s"
+					credentials: '%s'
 				}
 				{
 					account: "%s"
 					url: nats-leaf://127.0.0.1:%d
-					credentials: "%s"
+					credentials: '%s'
 				}
 			]
 		}
 		`
 	config := fmt.Sprintf(content,
+		leafName,
 		acc1.Name, acc2.Name,
 		acc1.Name, ob.LeafNode.Port, mycreds1,
 		acc2.Name, ob.LeafNode.Port, mycreds2)
 	conf = createConfFile(t, []byte(config))
-	defer os.Remove(conf)
 	sa, oa := RunServerWithConfig(conf)
 	defer sa.Shutdown()
 
@@ -3326,17 +3818,35 @@ func TestMonitorLeafz(t *testing.T) {
 			} else {
 				t.Fatalf("Expected account to be %q or %q, got %q", acc1.Name, acc2.Name, ln.Account)
 			}
+			if ln.Name != "hub" {
+				t.Fatalf("Expected name to be %q, got %q", "hub", ln.Name)
+			}
+			if !ln.IsSpoke {
+				t.Fatal("Expected leafnode connection to be spoke")
+			}
 			if ln.RTT == "" {
 				t.Fatalf("RTT not tracked?")
 			}
-			if ln.NumSubs != 2 {
-				t.Fatalf("Expected 2 subs, got %v", ln.NumSubs)
+			if ln.NumSubs != 3 {
+				t.Fatalf("Expected 3 subs, got %v", ln.NumSubs)
 			}
-			if len(ln.Subs) != 2 {
+			if len(ln.Subs) != 3 {
 				t.Fatalf("Expected subs to be returned, got %v", len(ln.Subs))
 			}
-			if (ln.Subs[0] != "foo" || ln.Subs[1] != "bar") && (ln.Subs[0] != "bar" || ln.Subs[1] != "foo") {
-				t.Fatalf("Unexpected subjects: %v", ln.Subs)
+			var foundFoo bool
+			var foundBar bool
+			for _, sub := range ln.Subs {
+				if sub == "foo" {
+					foundFoo = true
+				} else if sub == "bar" {
+					foundBar = true
+				}
+			}
+			if !foundFoo {
+				t.Fatal("Did not find subject foo")
+			}
+			if !foundBar {
+				t.Fatal("Did not find subject bar")
 			}
 		}
 	}
@@ -3345,15 +3855,35 @@ func TestMonitorLeafz(t *testing.T) {
 	for pollMode := 1; pollMode < 2; pollMode++ {
 		l := pollLeafz(t, sa, pollMode, pollURL, nil)
 		for _, ln := range l.Leafs {
-			if ln.NumSubs != 2 {
-				t.Fatalf("Number of subs should be 2, got %v", ln.NumSubs)
+			if ln.NumSubs != 3 {
+				t.Fatalf("Number of subs should be 3, got %v", ln.NumSubs)
 			}
 			if len(ln.Subs) != 0 {
 				t.Fatalf("Subs should not have been returned, got %v", ln.Subs)
 			}
 		}
 	}
-
+	// Make sure that we can request per account - existing account
+	pollURL = fmt.Sprintf("http://127.0.0.1:%d/leafz?acc=%s", sa.MonitorAddr().Port, acc1.Name)
+	for pollMode := 1; pollMode < 2; pollMode++ {
+		l := pollLeafz(t, sa, pollMode, pollURL, &LeafzOptions{Account: acc1.Name})
+		for _, ln := range l.Leafs {
+			if ln.Account != acc1.Name {
+				t.Fatalf("Expected leaf node to be from account %s, got: %v", acc1.Name, ln)
+			}
+		}
+		if len(l.Leafs) != 1 {
+			t.Fatalf("Expected only two leaf node for this account, got: %v", len(l.Leafs))
+		}
+	}
+	// Make sure that we can request per account - non existing account
+	pollURL = fmt.Sprintf("http://127.0.0.1:%d/leafz?acc=%s", sa.MonitorAddr().Port, "DOESNOTEXIST")
+	for pollMode := 1; pollMode < 2; pollMode++ {
+		l := pollLeafz(t, sa, pollMode, pollURL, &LeafzOptions{Account: "DOESNOTEXIST"})
+		if len(l.Leafs) != 0 {
+			t.Fatalf("Expected no leaf node for this account, got: %v", len(l.Leafs))
+		}
+	}
 	// Now polling server B.
 	pollURL = fmt.Sprintf("http://127.0.0.1:%d/leafz?subs=1", sb.MonitorAddr().Port)
 	for pollMode := 1; pollMode < 2; pollMode++ {
@@ -3382,12 +3912,691 @@ func TestMonitorLeafz(t *testing.T) {
 			} else {
 				t.Fatalf("Expected account to be %q or %q, got %q", acc1.Name, acc2.Name, ln.Account)
 			}
+			if ln.Name != leafName {
+				t.Fatalf("Expected name to be %q, got %q", leafName, ln.Name)
+			}
+			if ln.IsSpoke {
+				t.Fatal("Expected leafnode connection to be hub")
+			}
 			if ln.RTT == "" {
 				t.Fatalf("RTT not tracked?")
 			}
-			if ln.NumSubs != 0 || len(ln.Subs) != 0 {
-				t.Fatalf("Did not expect sub, got %v (%v)", ln.NumSubs, ln.Subs)
+			// LDS should be only one.
+			if ln.NumSubs != 4 || len(ln.Subs) != 4 {
+				t.Fatalf("Expected 3 subs, got %v (%v)", ln.NumSubs, ln.Subs)
 			}
+		}
+	}
+}
+
+func TestMonitorAccountz(t *testing.T) {
+	s := RunServer(DefaultMonitorOptions())
+	defer s.Shutdown()
+	body := string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s", s.MonitorAddr().Port, AccountzPath)))
+	require_Contains(t, body, `$G`)
+	require_Contains(t, body, `$SYS`)
+	require_Contains(t, body, `"accounts": [`)
+	require_Contains(t, body, `"system_account": "$SYS"`)
+
+	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?acc=$SYS", s.MonitorAddr().Port, AccountzPath)))
+	require_Contains(t, body, `"account_detail": {`)
+	require_Contains(t, body, `"account_name": "$SYS",`)
+	require_Contains(t, body, `"subscriptions": 40,`)
+	require_Contains(t, body, `"is_system": true,`)
+	require_Contains(t, body, `"system_account": "$SYS"`)
+
+	body = string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d%s?unused=1", s.MonitorAddr().Port, AccountStatzPath)))
+	require_Contains(t, body, `"acc": "$G"`)
+	require_Contains(t, body, `"acc": "$SYS"`)
+	require_Contains(t, body, `"sent": {`)
+	require_Contains(t, body, `"received": {`)
+	require_Contains(t, body, `"total_conns": 0,`)
+	require_Contains(t, body, `"leafnodes": 0,`)
+}
+
+func TestMonitorAuthorizedUsers(t *testing.T) {
+	kp, _ := nkeys.FromSeed(seed)
+	usrNKey, _ := kp.PublicKey()
+	opts := DefaultMonitorOptions()
+	opts.Nkeys = []*NkeyUser{{Nkey: string(usrNKey)}}
+	opts.Users = []*User{{Username: "user", Password: "pwd"}}
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	checkAuthUser := func(expected string) {
+		t.Helper()
+		resetPreviousHTTPConnections()
+		url := fmt.Sprintf("http://127.0.0.1:%d/connz?auth=true", s.MonitorAddr().Port)
+		for mode := 0; mode < 2; mode++ {
+			connz := pollConz(t, s, mode, url, &ConnzOptions{Username: true})
+			if l := len(connz.Conns); l != 1 {
+				t.Fatalf("Expected 1, got %v", l)
+			}
+			conn := connz.Conns[0]
+			au := conn.AuthorizedUser
+			if au == _EMPTY_ {
+				t.Fatal("AuthorizedUser is empty!")
+			}
+			if au != expected {
+				t.Fatalf("Expected %q, got %q", expected, au)
+			}
+		}
+	}
+
+	c := natsConnect(t, fmt.Sprintf("nats://user:pwd@127.0.0.1:%d", opts.Port))
+	defer c.Close()
+	checkAuthUser("user")
+	c.Close()
+
+	c = natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", opts.Port),
+		nats.Nkey(usrNKey, func(nonce []byte) ([]byte, error) {
+			return kp.Sign(nonce)
+		}))
+	defer c.Close()
+	// we should get the user's NKey
+	checkAuthUser(usrNKey)
+	c.Close()
+
+	s.Shutdown()
+	opts = DefaultMonitorOptions()
+	opts.Authorization = "sometoken"
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	c = natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", opts.Port),
+		nats.Token("sometoken"))
+	defer c.Close()
+	// We should get the token specified by the user
+	checkAuthUser("sometoken")
+	c.Close()
+	s.Shutdown()
+
+	opts = DefaultMonitorOptions()
+	// User an operator seed
+	kp, _ = nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	opts.TrustedKeys = []string{pub}
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(apub)
+	ajwt, err := nac.Encode(oKp)
+	if err != nil {
+		t.Fatalf("Error generating account JWT: %v", err)
+	}
+
+	nkp, _ := nkeys.CreateUser()
+	upub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(upub)
+	jwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	buildMemAccResolver(s)
+	addAccountToMemResolver(s, apub, ajwt)
+
+	c = natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", opts.Port),
+		nats.UserJWT(
+			func() (string, error) { return jwt, nil },
+			func(nonce []byte) ([]byte, error) { return nkp.Sign(nonce) }))
+	defer c.Close()
+	// we should get the user's pubkey
+	checkAuthUser(upub)
+}
+
+// Helper function to check that a JS cluster is formed
+func checkForJSClusterUp(t *testing.T, servers ...*Server) {
+	t.Helper()
+	// We will use the other JetStream helpers here.
+	c := &cluster{t: t, servers: servers}
+	c.checkClusterFormed()
+	c.waitOnClusterReady()
+}
+
+func TestMonitorJszNonJszServer(t *testing.T) {
+	srv := RunServer(DefaultOptions())
+	defer srv.Shutdown()
+
+	if !srv.ReadyForConnections(5 * time.Second) {
+		t.Fatalf("server did not become ready")
+	}
+
+	jsi, err := srv.Jsz(&JSzOptions{})
+	if err != nil {
+		t.Fatalf("jsi failed: %v", err)
+	}
+	if jsi.ID != srv.ID() {
+		t.Fatalf("did not receive valid info")
+	}
+
+	jsi, err = srv.Jsz(&JSzOptions{LeaderOnly: true})
+	if !errors.Is(err, errSkipZreq) {
+		t.Fatalf("expected a skip z req error: %v", err)
+	}
+	if jsi != nil {
+		t.Fatalf("expected no jsi: %v", jsi)
+	}
+}
+
+func TestMonitorJsz(t *testing.T) {
+	readJsInfo := func(url string) *JSInfo {
+		t.Helper()
+		body := readBody(t, url)
+		info := &JSInfo{}
+		err := json.Unmarshal(body, info)
+		require_NoError(t, err)
+		return info
+	}
+	srvs := []*Server{}
+	for _, test := range []struct {
+		port   int
+		mport  int
+		cport  int
+		routed int
+	}{
+		{7500, 7501, 7502, 5502},
+		{5500, 5501, 5502, 7502},
+	} {
+		tmpDir := t.TempDir()
+		cf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:%d
+		http: 127.0.0.1:%d
+		system_account: SYS
+		accounts {
+			SYS {
+				users [{user: sys, password: pwd}]
+			}
+			ACC {
+				users [{user: usr, password: pwd}]
+				// In clustered mode, these reservations will not impact any one server.
+				jetstream: {max_store: 4Mb, max_memory: 5Mb}
+			}
+			BCC_TO_HAVE_ONE_EXTRA {
+				users [{user: usr2, password: pwd}]
+				jetstream: enabled
+			}
+		}
+		jetstream: {
+			max_mem_store: 10Mb
+			max_file_store: 10Mb
+			store_dir: '%s'
+		}
+		cluster {
+			name: cluster_name
+			listen: 127.0.0.1:%d
+			routes: [nats-route://127.0.0.1:%d]
+		}
+		server_name: server_%d `, test.port, test.mport, tmpDir, test.cport, test.routed, test.port)))
+
+		s, _ := RunServerWithConfig(cf)
+		defer s.Shutdown()
+		srvs = append(srvs, s)
+	}
+	checkClusterFormed(t, srvs...)
+	checkForJSClusterUp(t, srvs...)
+
+	nc := natsConnect(t, "nats://usr:pwd@127.0.0.1:7500")
+	defer nc.Close()
+	js, err := nc.JetStream(nats.MaxWait(5 * time.Second))
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "my-stream-replicated",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 2,
+	})
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "my-stream-non-replicated",
+		Subjects: []string{"baz"},
+		Replicas: 1,
+	})
+	require_NoError(t, err)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "my-stream-mirror",
+		Replicas: 2,
+		Mirror: &nats.StreamSource{
+			Name: "my-stream-replicated",
+		},
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("my-stream-replicated", &nats.ConsumerConfig{
+		Durable:   "my-consumer-replicated",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("my-stream-non-replicated", &nats.ConsumerConfig{
+		Durable:   "my-consumer-non-replicated",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("my-stream-mirror", &nats.ConsumerConfig{
+		Durable:   "my-consumer-mirror",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+	nc.Flush()
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+	// Wait for mirror replication
+	time.Sleep(200 * time.Millisecond)
+
+	monUrl1 := fmt.Sprintf("http://127.0.0.1:%d/jsz", 7501)
+	monUrl2 := fmt.Sprintf("http://127.0.0.1:%d/jsz", 5501)
+
+	t.Run("default", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url)
+			if len(info.AccountDetails) != 0 {
+				t.Fatalf("expected no account to be returned by %s but got %v", url, info)
+			}
+			if info.Streams == 0 {
+				t.Fatalf("expected stream count to be 3 but got %d", info.Streams)
+			}
+			if info.Consumers == 0 {
+				t.Fatalf("expected consumer count to be 3 but got %d", info.Consumers)
+			}
+			if info.Messages != 2 {
+				t.Fatalf("expected two message but got %d", info.Messages)
+			}
+		}
+	})
+	t.Run("accounts", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?accounts=true")
+			if len(info.AccountDetails) != 2 {
+				t.Fatalf("expected both accounts to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("accounts reserved metrics", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?accounts=true&acc=ACC")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected single account")
+			}
+			acc := info.AccountDetails[0]
+			got := int(acc.ReservedMemory)
+			expected := 5242880
+			if got != expected {
+				t.Errorf("Expected: %v, got: %v", expected, got)
+			}
+			got = int(acc.ReservedStore)
+			expected = 4194304
+			if got != expected {
+				t.Errorf("Expected: %v, got: %v", expected, got)
+			}
+
+			info = readJsInfo(url + "?accounts=true&acc=BCC_TO_HAVE_ONE_EXTRA")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected single account")
+			}
+			acc = info.AccountDetails[0]
+			got = int(acc.ReservedMemory)
+			expected = -1
+			if got != expected {
+				t.Errorf("Expected: %v, got: %v", expected, got)
+			}
+			got = int(acc.ReservedStore)
+			expected = -1
+			if got != expected {
+				t.Errorf("Expected: %v, got: %v", expected, got)
+			}
+		}
+	})
+	t.Run("offset-too-big", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?accounts=true&offset=10")
+			if len(info.AccountDetails) != 0 {
+				t.Fatalf("expected no accounts to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("limit", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?accounts=true&limit=1")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info)
+			}
+			if info := readJsInfo(url + "?accounts=true&offset=1&limit=1"); len(info.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("offset-stable", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info1 := readJsInfo(url + "?accounts=true&offset=1&limit=1")
+			if len(info1.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info1)
+			}
+			info2 := readJsInfo(url + "?accounts=true&offset=1&limit=1")
+			if len(info2.AccountDetails) != 1 {
+				t.Fatalf("expected one account to be returned by %s but got %v", url, info2)
+			}
+			if info1.AccountDetails[0].Name != info2.AccountDetails[0].Name {
+				t.Fatalf("absent changes, same offset should result in same account but gut: %v %v",
+					info1.AccountDetails[0].Name, info2.AccountDetails[0].Name)
+			}
+		}
+	})
+	t.Run("filter-account", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if info.AccountDetails[0].Name != "ACC" {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams) != 0 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("streams", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&streams=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams) == 0 {
+				t.Fatalf("expected streams to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams[0].Consumer) != 0 {
+				t.Fatalf("expected no consumers to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("consumers", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&consumers=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if len(info.AccountDetails[0].Streams[0].Consumer) == 0 {
+				t.Fatalf("expected consumers to be returned by %s but got %v", url, info)
+			}
+			if info.AccountDetails[0].Streams[0].Config != nil {
+				t.Fatal("Config expected to not be present")
+			}
+			if info.AccountDetails[0].Streams[0].Consumer[0].Config != nil {
+				t.Fatal("Config expected to not be present")
+			}
+			if len(info.AccountDetails[0].Streams[0].ConsumerRaftGroups) != 0 {
+				t.Fatalf("expected consumer raft groups to not be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("config", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&consumers=true&config=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			if info.AccountDetails[0].Streams[0].Config == nil {
+				t.Fatal("Config expected to be present")
+			}
+			if info.AccountDetails[0].Streams[0].Consumer[0].Config == nil {
+				t.Fatal("Config expected to be present")
+			}
+		}
+	})
+	t.Run("replication", func(t *testing.T) {
+		// The replication lag may only be present on the leader
+		replicationFound := false
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&streams=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+			streamFound := false
+			for _, stream := range info.AccountDetails[0].Streams {
+				if stream.Name == "my-stream-mirror" {
+					streamFound = true
+					if stream.Mirror != nil {
+						replicationFound = true
+					}
+				}
+			}
+			if !streamFound {
+				t.Fatalf("Did not locate my-stream-mirror stream in results")
+			}
+		}
+		if !replicationFound {
+			t.Fatal("ReplicationLag expected to be present for my-stream-mirror stream")
+		}
+	})
+	t.Run("cluster-info", func(t *testing.T) {
+		found := 0
+		for i, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "")
+			if info.Meta.Peer != getHash(info.Meta.Leader) {
+				t.Fatalf("Invalid Peer: %+v", info.Meta)
+			}
+			if info.Meta.Replicas != nil {
+				found++
+				for _, r := range info.Meta.Replicas {
+					if r.Peer == _EMPTY_ {
+						t.Fatalf("Replicas' Peer is empty: %+v", r)
+					}
+				}
+				if info.Meta.Leader != srvs[i].Name() {
+					t.Fatalf("received cluster info from non leader: leader %s, server: %s", info.Meta.Leader, srvs[i].Name())
+				}
+			}
+		}
+		if found == 0 {
+			t.Fatalf("did not receive cluster info from any node")
+		}
+		if found > 1 {
+			t.Fatalf("received cluster info from multiple nodes")
+		}
+	})
+	t.Run("account-non-existing", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=DOES_NOT_EXIT")
+			if len(info.AccountDetails) != 0 {
+				t.Fatalf("expected no account to be returned by %s but got %v", url, info)
+			}
+		}
+	})
+	t.Run("raftgroups", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url + "?acc=ACC&consumers=true&raft=true")
+			if len(info.AccountDetails) != 1 {
+				t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+			}
+
+			// We will have two streams and order is not guaranteed. So grab the one we want.
+			var si StreamDetail
+			if info.AccountDetails[0].Streams[0].Name == "my-stream-replicated" {
+				si = info.AccountDetails[0].Streams[0]
+			} else {
+				si = info.AccountDetails[0].Streams[1]
+			}
+
+			if len(si.Consumer) == 0 {
+				t.Fatalf("expected consumers to be returned by %s but got %v", url, info)
+			}
+			if len(si.ConsumerRaftGroups) == 0 {
+				t.Fatalf("expected consumer raft groups to be returned by %s but got %v", url, info)
+			}
+			if len(si.RaftGroup) == 0 {
+				t.Fatal("expected stream raft group info to be included")
+			}
+			crgroup := si.ConsumerRaftGroups[0]
+			if crgroup.Name != "my-consumer-replicated" && crgroup.Name != "my-consumer-mirror" {
+				t.Fatalf("expected consumer name to be included in raft group info, got: %v", crgroup.Name)
+			}
+			if len(crgroup.RaftGroup) == 0 {
+				t.Fatal("expected consumer raft group info to be included")
+			}
+		}
+	})
+}
+
+func TestMonitorReloadTLSConfig(t *testing.T) {
+	template := `
+		listen: "127.0.0.1:-1"
+		https: "127.0.0.1:-1"
+		tls {
+			cert_file: '%s'
+			key_file: '%s'
+			ca_file: '../test/configs/certs/ca.pem'
+
+			# Set this to make sure that it does not impact secure monitoring
+			# (which it did, see issue: https://github.com/nats-io/nats-server/issues/2980)
+			verify_and_map: true
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template,
+		"../test/configs/certs/server-noip.pem",
+		"../test/configs/certs/server-key-noip.pem")))
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", s.MonitorAddr().Port)
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Error creating ws connection: %v", err)
+	}
+	defer c.Close()
+
+	tc := &TLSConfigOpts{CaFile: "../test/configs/certs/ca.pem"}
+	tlsConfig, err := GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating TLS config: %v", err)
+	}
+	tlsConfig.ServerName = "127.0.0.1"
+	tlsConfig.RootCAs = tlsConfig.ClientCAs
+	tlsConfig.ClientCAs = nil
+	c = tls.Client(c, tlsConfig.Clone())
+	if err := c.(*tls.Conn).Handshake(); err == nil || !strings.Contains(err.Error(), "SAN") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	c.Close()
+
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template,
+		"../test/configs/certs/server-cert.pem",
+		"../test/configs/certs/server-key.pem"))
+
+	c, err = net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Error creating ws connection: %v", err)
+	}
+	defer c.Close()
+
+	c = tls.Client(c, tlsConfig.Clone())
+	if err := c.(*tls.Conn).Handshake(); err != nil {
+		t.Fatalf("Error on TLS handshake: %v", err)
+	}
+
+	// Need to read something to see if there is a problem with the certificate or not.
+	var buf [64]byte
+	c.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	_, err = c.Read(buf[:])
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("Error: %v", err)
+	}
+}
+
+func TestMonitorMQTT(t *testing.T) {
+	o := DefaultOptions()
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPPort = -1
+	o.ServerName = "mqtt_server"
+	o.Users = []*User{{Username: "someuser"}}
+	pinnedCerts := make(PinnedCertSet)
+	pinnedCerts["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"] = struct{}{}
+	o.MQTT = MQTTOpts{
+		Host:           "127.0.0.1",
+		Port:           -1,
+		NoAuthUser:     "someuser",
+		JsDomain:       "js",
+		AuthTimeout:    2.0,
+		TLSMap:         true,
+		TLSTimeout:     3.0,
+		TLSPinnedCerts: pinnedCerts,
+		AckWait:        4 * time.Second,
+		MaxAckPending:  256,
+	}
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	expected := &MQTTOptsVarz{
+		Host:           "127.0.0.1",
+		Port:           o.MQTT.Port,
+		NoAuthUser:     "someuser",
+		JsDomain:       "js",
+		AuthTimeout:    2.0,
+		TLSMap:         true,
+		TLSTimeout:     3.0,
+		TLSPinnedCerts: []string{"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"},
+		AckWait:        4 * time.Second,
+		MaxAckPending:  256,
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, s, mode, url, nil)
+		vm := &v.MQTT
+		if !reflect.DeepEqual(vm, expected) {
+			t.Fatalf("Expected\n%+v\nGot:\n%+v", expected, vm)
+		}
+	}
+}
+
+func TestMonitorWebsocket(t *testing.T) {
+	o := DefaultOptions()
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPPort = -1
+	kp, _ := nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	o.TrustedKeys = []string{pub}
+	o.Users = []*User{{Username: "someuser"}}
+	pinnedCerts := make(PinnedCertSet)
+	pinnedCerts["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"] = struct{}{}
+	o.Websocket = WebsocketOpts{
+		Host:             "127.0.0.1",
+		Port:             -1,
+		Advertise:        "somehost:8080",
+		NoAuthUser:       "someuser",
+		JWTCookie:        "somecookiename",
+		AuthTimeout:      2.0,
+		NoTLS:            true,
+		TLSMap:           true,
+		TLSPinnedCerts:   pinnedCerts,
+		SameOrigin:       true,
+		AllowedOrigins:   []string{"origin1", "origin2"},
+		Compression:      true,
+		HandshakeTimeout: 4 * time.Second,
+	}
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	expected := &WebsocketOptsVarz{
+		Host:             "127.0.0.1",
+		Port:             o.Websocket.Port,
+		Advertise:        "somehost:8080",
+		NoAuthUser:       "someuser",
+		JWTCookie:        "somecookiename",
+		AuthTimeout:      2.0,
+		NoTLS:            true,
+		TLSMap:           true,
+		TLSPinnedCerts:   []string{"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"},
+		SameOrigin:       true,
+		AllowedOrigins:   []string{"origin1", "origin2"},
+		Compression:      true,
+		HandshakeTimeout: 4 * time.Second,
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, s, mode, url, nil)
+		vw := &v.Websocket
+		if !reflect.DeepEqual(vw, expected) {
+			t.Fatalf("Expected\n%+v\nGot:\n%+v", expected, vw)
 		}
 	}
 }

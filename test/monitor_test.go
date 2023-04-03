@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,9 +18,10 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,7 +41,7 @@ func runMonitorServer() *server.Server {
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = MONITOR_PORT
 	opts.HTTPHost = "127.0.0.1"
-
+	opts.NoSystemAccount = true
 	return RunServer(&opts)
 }
 
@@ -51,8 +52,9 @@ func runMonitorServerClusteredPair(t *testing.T) (*server.Server, *server.Server
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = MONITOR_PORT
 	opts.HTTPHost = "127.0.0.1"
-	opts.Cluster = server.ClusterOpts{Host: "127.0.0.1", Port: 10223}
+	opts.Cluster = server.ClusterOpts{Name: "M", Host: "127.0.0.1", Port: 10223}
 	opts.Routes = server.RoutesFromStr("nats-route://127.0.0.1:10222")
+	opts.NoSystemAccount = true
 
 	s1 := RunServer(&opts)
 
@@ -60,8 +62,9 @@ func runMonitorServerClusteredPair(t *testing.T) (*server.Server, *server.Server
 	opts2.Port = CLIENT_PORT + 1
 	opts2.HTTPPort = MONITOR_PORT + 1
 	opts2.HTTPHost = "127.0.0.1"
-	opts2.Cluster = server.ClusterOpts{Host: "127.0.0.1", Port: 10222}
+	opts2.Cluster = server.ClusterOpts{Name: "M", Host: "127.0.0.1", Port: 10222}
 	opts2.Routes = server.RoutesFromStr("nats-route://127.0.0.1:10223")
+	opts2.NoSystemAccount = true
 
 	s2 := RunServer(&opts2)
 
@@ -75,6 +78,7 @@ func runMonitorServerNoHTTPPort() *server.Server {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = 0
+	opts.NoSystemAccount = true
 
 	return RunServer(&opts)
 }
@@ -175,7 +179,7 @@ func TestVarz(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
@@ -201,7 +205,7 @@ func TestVarz(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
@@ -253,7 +257,7 @@ func TestConnz(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
@@ -285,7 +289,7 @@ func TestConnz(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
@@ -367,7 +371,7 @@ func TestTLSConnz(t *testing.T) {
 
 	url := fmt.Sprintf("https://127.0.0.1:%d/", opts.HTTPSPort)
 	tlsConfig := &tls.Config{}
-	caCert, err := ioutil.ReadFile(rootCAFile)
+	caCert, err := os.ReadFile(rootCAFile)
 	if err != nil {
 		t.Fatalf("Got error reading RootCA file: %s", err)
 	}
@@ -391,7 +395,7 @@ func TestTLSConnz(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
@@ -474,7 +478,7 @@ func TestConnzWithSubs(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
@@ -520,7 +524,7 @@ func TestConnzWithAuth(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
@@ -581,7 +585,7 @@ func TestConnzWithAccounts(t *testing.T) {
 			t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 		}
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("Got an error reading the body: %v\n", err)
 		}
@@ -699,7 +703,7 @@ func TestConnzWithOffsetAndLimit(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
@@ -738,7 +742,7 @@ func TestSubsz(t *testing.T) {
 		t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
